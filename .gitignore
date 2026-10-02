@@ -13,6 +13,7 @@ __pycache__/
 
 # ---- 本地工具 / 临时文件 ----
 .mimosa/
+.codegraph/
 _shots/
 *.log
 _tmp_*
