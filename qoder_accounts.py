@@ -283,6 +283,21 @@ CHECKIN_PROBE_TTL = 6 * 3600
 # 活动列表缓存 TTL：活动状态变化很慢（每日一轮），20 秒内复用可让看板切换视图
 # /账号不再等那 1–4 秒的上游请求；领取动作会强制绕过并立即失效缓存。
 CAMPAIGNS_TTL = 20
+
+def campaign_label(c):
+    """活动显示名：官方中文标题（placements content.zh.title）优先，其次 key。"""
+    c = c or {}
+    return str(c.get("title_zh") or "").strip() or         str(c.get("campaign_key") or c.get("campaign_id") or "")
+
+
+# 活动领取失败码 -> 中文说明（与官方 growth-page/activity-iframe 前端一致）
+_CAMPAIGN_FAILURE_CN = {
+    "REDEMPTION_CODE_OUT_OF_STOCK": "今日名额已发完（每日 10:00 刷新，次日再来）",
+    "ACHIEVEMENT_NOT_COMPLETED": "需先完成新人任务（成就未完成）",
+    "CAMPAIGN_NOT_ACTIVE": "活动已结束/未开始",
+    "RISK_BLOCKED": "风控拦截（当前设备/账号不可领取）",
+    "RISK_DEPENDENCY_UNAVAILABLE": "风控服务不可用，稍后重试",
+}
 CHECKIN_REASON_NOT_FOUND = "checkin_endpoint_not_found"
 
 # 会话死亡标记：上游主动吊销离线会话，刷新已无意义，需要重新登录。
@@ -495,6 +510,12 @@ class Account(object):
         self.credits = data.get("credits") or None
         self.plan = str(data.get("plan") or "")
         self.last_checkin = data.get("lastCheckin") or None
+        # 已领取活动的兑换码（如「奶茶免单卡」REDEMPTION_CODE）：活动只发一次，
+        # 必须落盘持久化，否则网关重启后用户就找不回兑换码了。
+        self.campaign_codes = dict(data.get("campaignCodes") or {})
+        # 被"同人已领取"挡下的活动 -> 冷却截止时间戳。服务端按"人"去重（同机器/
+        # 同身份多账号共用一张），被挡后反复重试没有意义，只会刷日志。
+        self.campaign_blocked_until = dict(data.get("campaignBlockedUntil") or {})
         self.user_type = str(data.get("userType") or "") or DEFAULT_USER_TYPE
         self.organization_id = str(data.get("organizationId") or "")
         self.organization_name = str(data.get("organizationName") or "")
@@ -538,6 +559,8 @@ class Account(object):
             "credits": self.credits,
             "plan": self.plan,
             "lastCheckin": self.last_checkin,
+            "campaignCodes": self.campaign_codes,
+            "campaignBlockedUntil": self.campaign_blocked_until,
             "userType": self.user_type,
             "organizationId": self.organization_id,
             "organizationName": self.organization_name,
@@ -1062,7 +1085,27 @@ class Account(object):
                 continue
             placements = c.get("placements")
             benefit = c.get("benefit") if isinstance(c.get("benefit"), dict) else {}
+            # 官方中文标题/说明/详情页（placements[].content.zh）——活动名直接显示中文
+            title_zh = title_en = desc_zh = detail = button = ""
+            for pl in (placements if isinstance(placements, list) else []):
+                cont = (pl or {}).get("content")
+                if not isinstance(cont, dict):
+                    continue
+                zh = cont.get("zh") if isinstance(cont.get("zh"), dict) else {}
+                en = cont.get("en") if isinstance(cont.get("en"), dict) else {}
+                title_zh = title_zh or str(zh.get("title") or "")
+                title_en = title_en or str(en.get("title") or "")
+                desc_zh = desc_zh or str(zh.get("description") or "")
+                detail = detail or str(zh.get("detailUrl") or en.get("detailUrl") or "")
+                button = button or str(zh.get("buttonText") or en.get("buttonText") or "")
+                if title_zh and desc_zh and detail:
+                    break
             items.append({
+                "title_zh": title_zh,
+                "title_en": title_en,
+                "desc_zh": desc_zh,
+                "detail_url": detail,
+                "button_text": button,
                 "campaign_id": str(c.get("campaignId") or c.get("campaign_id") or ""),
                 "campaign_key": str(c.get("campaignKey") or c.get("campaign_key") or ""),
                 "action_type": str(c.get("actionType") or c.get("action_type") or ""),
@@ -1148,23 +1191,45 @@ class Account(object):
                     "raw": r}
         if not status and r.get("success") is False:
             return {"ok": False, "error": str(r.get("error") or r)[:160]}
+        # 兑换码类奖励（REDEMPTION_CODE）：官方客户端语义 = CLAIMED 且
+        # redemptionCode 非空才算拿到；仅 CLAIMED 无码 = 发放确认中。
+        code = str(r.get("redemptionCode") or "").strip()
+        if code:
+            self.campaign_codes[campaign_id] = code
+            if self.path and os.path.exists(os.path.dirname(self.path)):
+                self.save(os.path.dirname(self.path))
+        if failure in _CAMPAIGN_FAILURE_CN:
+            return {"ok": False, "status": status or "NOT_ELIGIBLE",
+                    "failure_code": failure, "replayed": False,
+                    "redemption_code": code,
+                    "message": _CAMPAIGN_FAILURE_CN[failure], "raw": r}
         return {
             "ok": status in ("CLAIMED", "GRANTED", "SUCCESS"),
             "status": status,
             "replayed": bool(r.get("replayed")),
             "failure_code": failure or "",
             "grant_id": str(r.get("grantId") or ""),
+            "redemption_code": code,
+            "confirming": bool(status == "CLAIMED" and not code),
             "amount": int(((r.get("benefit") or {}) if isinstance(r.get("benefit"), dict)
                            else {}).get("amount") or r.get("amount") or 0),
-            "message": "已领取" if r.get("replayed") else "领取成功",
+            "message": ("已领取" if r.get("replayed") else "领取成功")
+                       + (("，兑换码：%s" % code) if code else
+                          ("，兑换码发放确认中" if status == "CLAIMED" else "")),
             "raw": r,
         }
 
-    def campaign_checkin(self, gap=0.5):
+    # 兼容类内调用：self.campaign_label(c) / qoder_accounts.campaign_label(c)
+    campaign_label = staticmethod(campaign_label)
+
+    def campaign_checkin(self, gap=0.5, only_kinds=None):
         """活动平台签到：领取所有 CLAIMABLE 的 Credits 活动（每日 100 等）。
 
         先强制刷新原生机器身份（身份会轮换，缓存过期会让列表被过滤 → 漏领），
         再列活动、逐个领取。多账户场景下每个账号独立走这一遍。
+
+        only_kinds: 只领这些 benefit.kind 的活动（如 ("", "CREDITS") 表示只做
+                    每日签到领积分，不动兑换码/券类福利）。
 
         返回 {ok, claimed:[...], already:[...], earned, message, campaigns}
           - 已是 CLAIMED 的活动计入 already（"今日已领取"）
@@ -1177,17 +1242,46 @@ class Account(object):
         st = self.campaigns(force=True)      # 领取路径必须绕过缓存，看最新状态
         if not st.get("ok"):
             return {"ok": False, "error": st.get("error") or "campaigns 查询失败",
-                    "earned": 0, "claimed": [], "already": [], "blocked": []}
+                    "earned": 0, "claimed": [], "already": [], "blocked": [],
+                    "pending": [], "locked": [], "codes": [], "views": []}
         claimed, already, earned, errors, blocked = [], [], 0, [], []
+        pending, locked, codes, views = [], [], [], []   # 券/成就/详情类
         for c in st["campaigns"]:
+            if only_kinds is not None:
+                kind = str((c.get("benefit") or {}).get("kind") or "").upper()
+                if kind not in only_kinds:
+                    continue      # 只要"每日签到领积分"时跳过券类/其它奖励
+                if str(c.get("action_type") or "") not in ("", "CLAIM_BENEFIT"):
+                    continue      # 详情类（VIEW_DETAILS）无奖励，不算签到
+            cid = c["campaign_id"]
+            cname = c["campaign_key"] or cid
+            label = self.campaign_label(c)
+            reason = str(c.get("unavailable_reason") or "").upper()
             if c["claim_status"] == "CLAIMED":
-                already.append(c)
+                if str(c.get("action_type") or "") == "VIEW_DETAILS":
+                    views.append(c)      # 详情类活动：没有奖励可领，不算"已领取"
+                else:
+                    already.append(c)
+                if self.campaign_codes.get(cid):
+                    codes.append({"campaign": label, "code": self.campaign_codes[cid]})
                 continue
             if c["claim_status"] != "CLAIMABLE":
+                # 不可领取但并非"与我们无关"：名额发完 / 成就未完成要如实报出来
+                # （官方前端状态机：REDEMPTION_CODE_OUT_OF_STOCK=outOfStock，
+                #   ACHIEVEMENT_NOT_COMPLETED=locked）
+                if reason == "REDEMPTION_CODE_OUT_OF_STOCK":
+                    pending.append(c)
+                elif reason == "ACHIEVEMENT_NOT_COMPLETED"                         or c.get("achievement_completed") is False:
+                    locked.append(c)
                 continue
             if c["action_type"] and c["action_type"] != "CLAIM_BENEFIT":
                 continue      # VIEW_DETAILS 类活动无需（也不能）领取
-            res = self.claim_campaign(c["campaign_id"])
+            if self.campaign_blocked_until.get(cid, 0) > time.time():
+                blocked.append({"campaign": cname,
+                                "failure_code": "SAME_PERSON_ALREADY_CLAIMED",
+                                "cooldown": True})
+                continue      # 同人已领（冷却中）：不再重复 POST
+            res = self.claim_campaign(cid)
             if res.get("ok"):
                 amount = res.get("amount") or c["benefit"]["amount"] or 0
                 self._stamp_checkin()
@@ -1196,32 +1290,65 @@ class Account(object):
                 else:
                     claimed.append(c)
                     earned += int(amount or 0)
+                if res.get("redemption_code"):
+                    codes.append({"campaign": label,
+                                  "code": res["redemption_code"]})
                 time.sleep(max(0.0, gap))
             elif res.get("blocked"):
-                # 服务端按"人"去重：同机器/同身份下其他账号本轮已领
-                blocked.append({"campaign": c["campaign_key"] or c["campaign_id"],
+                # 服务端按"人"去重：同机器/同身份下其他账号本轮已领。
+                # 记 6 小时冷却（多账号同机器时不必每轮都试），并保留原因。
+                self.campaign_blocked_until[cid] = time.time() + 6 * 3600
+                if self.path and os.path.exists(os.path.dirname(self.path)):
+                    self.save(os.path.dirname(self.path))
+                blocked.append({"campaign": label,
                                 "failure_code": res.get("failure_code")})
+            elif res.get("failure_code") in _CAMPAIGN_FAILURE_CN:
+                # 领取瞬间名额发完 / 任务未完成等：按"待重试/被锁"分类，不算失败
+                slot = (pending if res["failure_code"] == "REDEMPTION_CODE_OUT_OF_STOCK"
+                        else locked)
+                slot.append(c)
             else:
-                errors.append("%s: %s" % (c["campaign_key"] or c["campaign_id"],
-                                          res.get("error")))
+                errors.append("%s: %s" % (cname, res.get("error")))
         if claimed:
             msg = "活动领取成功 +%d Credits（%s）" % (
-                earned, ", ".join(c["campaign_key"] or c["campaign_id"]
-                                  for c in claimed))
+                earned, "、".join(self.campaign_label(c) for c in claimed))
         elif blocked:
             msg = ("同人已领取：同一设备/身份下的其他账号本轮已领过（服务端按人去重，"
                    "failureCode=%s）" % blocked[0].get("failure_code"))
         elif already:
-            msg = "今日活动奖励已领取（%s）" % ", ".join(
-                c["campaign_key"] or c["campaign_id"] for c in already)
+            msg = "今日活动奖励已领取（%s）" % "、".join(
+                self.campaign_label(c) for c in already)
+        elif pending:
+            msg = ("名额已发完，次日 10:00 后可再领：%s（活动 %s）" % (
+                "、".join(c["required_achievement_key"] or "无门槛任务"
+                          for c in pending),
+                ", ".join(c["campaign_key"] or c["campaign_id"] for c in pending)))
+        elif locked:
+            msg = ("需先在官方桌面端完成新人任务后可领：%s（活动 %s）" % (
+                ", ".join(c["required_achievement_key"] or "?"
+                          for c in locked),
+                ", ".join(c["campaign_key"] or c["campaign_id"] for c in locked)))
         elif errors:
             msg = "活动领取失败：%s" % "; ".join(errors)[:200]
         else:
             msg = "当前账号暂无可领取的官方活动"
+        # 有待补货/待完成任务的活动时，把它们附在结论里（一键签到日志要能看到）
+        extra = ""
+        if pending:
+            extra = "；另有活动今日名额已发完、次日 10:00 后重试：%s" % "、".join(
+                self.campaign_label(c) for c in pending)
+        elif locked:
+            extra = "；另有活动需先完成新人任务（%s）：%s" % (", ".join(
+                c.get("required_achievement_key") or "?" for c in locked),
+                "、".join(self.campaign_label(c) for c in locked))
+        if extra and "名额已发完" not in msg and "新人任务" not in msg:
+            msg += extra
         # 领取动作会改变活动状态：让下一次列表查询重新拉取（不吃 20s 缓存）
         self._campaigns_cache = None
         return {"ok": not errors, "claimed": claimed, "already": already,
                 "blocked": blocked, "earned": earned, "message": msg,
+                "pending": pending, "locked": locked, "codes": codes,
+                "views": views,
                 "campaigns": st["campaigns"], "errors": errors}
 
 

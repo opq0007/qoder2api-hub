@@ -1466,13 +1466,23 @@ A.Account.checkin_status = _stub_status
 _A_CAMPAIGNS = {
     "intl": {"ok": True, "available": True, "show_campaign": True,
              "claimable": False, "campaign_url": "https://openapi.qoder.sh/growth-page/activity-iframe",
-             "campaigns": [{"campaign_id": "c-intl", "campaign_key": "act-intl",
-                            "action_type": "VIEW_DETAILS", "claim_status": "CLAIMED",
-                            "start_at": 0, "end_at": 0,
-                            "benefit": {"kind": "", "amount": 0},
-                            "required_achievement_key": "",
-                            "achievement_completed": False, "unavailable_reason": "",
-                            "placements": []}]},
+             "campaigns": [
+                 {"campaign_id": "c-intl", "campaign_key": "act-intl",
+                  "action_type": "CLAIM_BENEFIT", "claim_status": "CLAIMED",
+                  "title_zh": "每天领 100 Credits",
+                  "start_at": 0, "end_at": 0,
+                  "benefit": {"kind": "CREDITS", "amount": 100},
+                  "required_achievement_key": "",
+                  "achievement_completed": False, "unavailable_reason": "",
+                  "placements": []},
+                 # 详情类活动（无奖励）：不应被算作"签到奖励"
+                 {"campaign_id": "c-detail", "campaign_key": "act-detail",
+                  "action_type": "VIEW_DETAILS", "claim_status": "CLAIMED",
+                  "start_at": 0, "end_at": 0,
+                  "benefit": {"kind": "", "amount": 0},
+                  "required_achievement_key": "",
+                  "achievement_completed": False, "unavailable_reason": "",
+                  "placements": []}]},
     "cn": {"ok": True, "available": True, "show_campaign": True,
            "claimable": True, "campaign_url": "https://openapi.qoder.com.cn/growth-page/activity-iframe",
            "campaigns": [{"campaign_id": "c-cn", "campaign_key": "act-daily-100",
@@ -1505,9 +1515,11 @@ check("task center lists BOTH realms",
       _view_all["accounts"])
 _intl_row = [t for t in _view_intl["tasks"] if t["task_code"] == "daily_checkin"][0]
 _cn_row = [t for t in _view_cn["tasks"] if t["task_code"] == "daily_checkin"][0]
-check("intl: claimed campaign renders as 今日已领取 (not an empty row)",
-      _intl_row["status"] == "claimed" and "今日已领取" in _intl_row["description"],
-      _intl_row)
+check("intl: claimed 每日 Credits renders as 今日已领取（中文活动名）",
+      _intl_row["status"] == "claimed" and "今日已领取" in _intl_row["description"]
+      and "每天领 100 Credits" in _intl_row["description"], _intl_row)
+check("每日行不计入详情类活动（VIEW_DETAILS 不算签到奖励）",
+      "act-detail" not in _intl_row["description"], _intl_row["description"])
 check("cn: CLAIMABLE campaign renders as 待领奖 + reward amount",
       _cn_row["status"] == "completed" and _cn_row["reward_credit"] == 100
       and "领取" in _cn_row["description"], _cn_row)
@@ -2032,9 +2044,463 @@ check("不传 realm 时保持原行为（全部账号）",
       len(_v_all["accounts"]) == 2, _v_all["accounts"])
 
 print()
-print("[30] 账号级 IP 代理：URL 解析 / 脱敏 / 隧道握手 / fail-closed / 熔断")
+print("[23] 兑换码/券类活动（奶茶免单卡 act-20260928-620）")
+# --- 23.1 领取响应：捕获 redemptionCode 并持久化 ---
+_orig_hj23 = A.http_json
 
-# --- 30.1 URL 解析 ----------------------------------------------------------
+
+def _fake_claim_code(url, **kw):
+    return {"status": "CLAIMED", "replayed": False,
+            "grantId": "g-coffee", "redemptionCode": "MT-ABCD-1234",
+            "benefit": {"kind": "REDEMPTION_CODE", "amount": 1}}
+
+
+A.http_json = _fake_claim_code
+_acc23 = A.Account({"uid": "coffee23", "realm": "cn", "accessToken": "dt-x"})
+_res23 = _acc23.claim_campaign("c-coffee")
+A.http_json = _orig_hj23
+check("claim 响应捕获兑换码", _res23["ok"] and _res23["redemption_code"] == "MT-ABCD-1234",
+      _res23)
+check("兑换码写入账号（可持久化，重启不丢）",
+      _acc23.campaign_codes.get("c-coffee") == "MT-ABCD-1234"
+      and _acc23.to_dict().get("campaignCodes", {}).get("c-coffee") == "MT-ABCD-1234",
+      _acc23.campaign_codes)
+_acc23b = A.Account(_acc23.to_dict())
+check("新 Account 能读回兑换码",
+      _acc23b.campaign_codes.get("c-coffee") == "MT-ABCD-1234")
+check("领取成功消息带上兑换码", "兑换码" in _res23["message"], _res23["message"])
+
+# --- 23.2 CLAIMED 但无码 -> 发放确认中 ---
+def _fake_claim_nocode(url, **kw):
+    return {"status": "CLAIMED", "replayed": False, "grantId": "g2",
+            "benefit": {"kind": "REDEMPTION_CODE", "amount": 1}}
+
+
+A.http_json = _fake_claim_nocode
+_res23b = _acc23.claim_campaign("c-coffee2")
+check("CLAIMED 无兑换码 -> confirming 标记", _res23b.get("confirming") is True, _res23b)
+A.http_json = _orig_hj23
+
+# --- 23.3 失败码映射（名额发完 / 成就未完成）---
+def _fake_claim_oos(url, **kw):
+    return {"status": "NOT_ELIGIBLE", "failureCode": "REDEMPTION_CODE_OUT_OF_STOCK"}
+
+
+A.http_json = _fake_claim_oos
+_res23c = _acc23.claim_campaign("c-coffee")
+A.http_json = _orig_hj23
+check("名额发完 -> 失败码 + 中文说明",
+      not _res23c["ok"] and _res23c["failure_code"] == "REDEMPTION_CODE_OUT_OF_STOCK"
+      and "名额已发完" in _res23c["message"], _res23c)
+
+# --- 23.4 campaign_checkin 分类：pending / locked / codes ---
+_orig_camp23 = A.Account.campaigns
+_orig_native23 = A.native_machine_identity
+
+
+def _stub_campains23(self, force=False):
+    return {"ok": True, "available": True, "show_campaign": True, "claimable": False,
+            "campaign_url": "https://openapi.qoder.com.cn/growth-page/activity-iframe",
+            "identity": "runtime-info",
+            "campaigns": [
+                {"campaign_id": "c-daily", "campaign_key": "act-daily",
+                 "action_type": "CLAIM_BENEFIT", "claim_status": "CLAIMED",
+                 "start_at": 0, "end_at": 0,
+                 "benefit": {"kind": "CREDITS", "amount": 100},
+                 "required_achievement_key": "", "achievement_completed": True,
+                 "unavailable_reason": "", "placements": []},
+                {"campaign_id": "c-coffee", "campaign_key": "act-20260928-620",
+                 "action_type": "CLAIM_BENEFIT", "claim_status": "NOT_ELIGIBLE",
+                 "start_at": 0, "end_at": 0,
+                 "benefit": {"kind": "REDEMPTION_CODE", "amount": 1},
+                 "required_achievement_key": "sites_first_use",
+                 "achievement_completed": True,
+                 "unavailable_reason": "REDEMPTION_CODE_OUT_OF_STOCK",
+                 "placements": []},
+                {"campaign_id": "c-task", "campaign_key": "act-locked",
+                 "action_type": "CLAIM_BENEFIT", "claim_status": "NOT_ELIGIBLE",
+                 "start_at": 0, "end_at": 0,
+                 "benefit": {"kind": "CREDITS", "amount": 50},
+                 "required_achievement_key": "goal_first_use",
+                 "achievement_completed": False,
+                 "unavailable_reason": "ACHIEVEMENT_NOT_COMPLETED",
+                 "placements": []}]}
+
+
+A.Account.campaigns = _stub_campains23
+A.native_machine_identity = lambda realm, uid, force=False: {
+    "machineToken": "t", "machineType": "ty", "machineCode": "c", "source": "runtime-info"}
+_acc23c = A.Account({"uid": "coffee23c", "realm": "cn", "accessToken": "dt-x"})
+try:
+    _res23d = _acc23c.campaign_checkin(gap=0)
+finally:
+    A.Account.campaigns = _orig_camp23
+    A.native_machine_identity = _orig_native23
+check("名额发完的活动进 pending（不是被当成无活动）",
+      [c["campaign_key"] for c in _res23d["pending"]] == ["act-20260928-620"],
+      _res23d.get("pending"))
+check("成就未完成的活动进 locked",
+      [c["campaign_key"] for c in _res23d["locked"]] == ["act-locked"],
+      _res23d.get("locked"))
+check("结论里带次日重试提示", "次日 10:00" in _res23d["message"], _res23d["message"])
+
+# --- 23.5 独立任务行（奶茶免单卡）+ 兑换码回显 ---
+_orig_camp23b = A.Account.campaigns
+A.Account.campaigns = _stub_campains23
+_acc23e = A.Account({"uid": "coffee23e", "realm": "cn", "accessToken": "dt-x"})
+_acc23e.campaign_codes = {"c-coffee": "MT-ZZZZ-9999"}
+try:
+    _rows23 = T._extra_campaign_rows(_acc23e, _acc23e.campaigns())
+finally:
+    A.Account.campaigns = _orig_camp23b
+_codes23 = [r["task_code"] for r in _rows23]
+check("券类活动单独成行（只含非 Credits 奖励）",
+      _codes23 == ["campaign:act-20260928-620"], _codes23)
+_crow = _rows23[0]
+check("行内含中文名额状态 + 奖励文本",
+      "名额已发完" in _crow["description"] and _crow["reward_text"] == "兑换码 ×1",
+      _crow)
+check("券类行不误报积分", _crow["reward_credit"] == 0, _crow["reward_credit"])
+
+
+def _stub_campains_claimed23(self, force=False):
+    out = _stub_campains23(self, force)
+    out["campaigns"][1]["claim_status"] = "CLAIMED"
+    out["campaigns"][1]["unavailable_reason"] = ""
+    return out
+
+
+A.Account.campaigns = _stub_campains_claimed23
+try:
+    _rows23b = T._extra_campaign_rows(_acc23e, _acc23e.campaigns())
+finally:
+    A.Account.campaigns = _orig_camp23b
+check("已领取的券类活动回显兑换码",
+      _rows23b[0]["status"] == "claimed"
+      and "MT-ZZZZ-9999" in _rows23b[0]["description"], _rows23b[0])
+
+# --- 23.6 多账号：同人已领 -> 冷却，不再重复 POST ---
+_orig_camp23c = A.Account.campaigns
+_orig_claim23 = A.Account.claim_campaign
+_orig_native23b = A.native_machine_identity
+_posts = []
+
+
+def _stub_camp_claimable23(self, force=False):
+    return {"ok": True, "available": True, "show_campaign": True, "claimable": True,
+            "campaign_url": "", "identity": "runtime-info",
+            "campaigns": [{"campaign_id": "c-cup", "campaign_key": "act-cup",
+                           "action_type": "CLAIM_BENEFIT", "claim_status": "CLAIMABLE",
+                           "start_at": 0, "end_at": 0,
+                           "benefit": {"kind": "REDEMPTION_CODE", "amount": 1},
+                           "required_achievement_key": "", "achievement_completed": True,
+                           "unavailable_reason": "", "placements": []}]}
+
+
+def _stub_claim_blocked23(self, campaign_id):
+    _posts.append(campaign_id)
+    return {"ok": False, "blocked": True, "status": "BLOCKED",
+            "failure_code": "SAME_PERSON_ALREADY_CLAIMED",
+            "message": "同人已领取"}
+
+
+A.Account.campaigns = _stub_camp_claimable23
+A.Account.claim_campaign = _stub_claim_blocked23
+A.native_machine_identity = lambda realm, uid, force=False: {
+    "machineToken": "t", "machineType": "ty", "machineCode": "c", "source": "runtime-info"}
+_acc23f = A.Account({"uid": "multi23", "realm": "cn", "accessToken": "dt-x"})
+try:
+    _r1 = _acc23f.campaign_checkin(gap=0)
+    _r2 = _acc23f.campaign_checkin(gap=0)      # 冷却内：不应再 POST
+finally:
+    A.Account.campaigns = _orig_camp23c
+    A.Account.claim_campaign = _orig_claim23
+    A.native_machine_identity = _orig_native23b
+check("同人已领 -> 记录冷却并如实上报（不是失败）",
+      _r1["ok"] and _r1["blocked"] and _r1["blocked"][0]["failure_code"]
+      == "SAME_PERSON_ALREADY_CLAIMED", _r1.get("blocked"))
+check("冷却内的第二次不再重复 POST（多账号同机器不空转）",
+      _posts == ["c-cup"], _posts)
+check("冷却写入账号（可持久化）",
+      _acc23f.campaign_blocked_until.get("c-cup", 0) > time.time()
+      and _acc23f.campaign_blocked_until.get("c-cup", 0)
+      <= time.time() + 6 * 3600 + 5, _acc23f.campaign_blocked_until)
+
+# --- 23.7 summary.codes：按账号暴露已领兑换码 ---
+_orig_ftv23 = T._fetch_upstream_parallel
+T._fetch_upstream_parallel = lambda account, force=False: (
+    {"ok": True, "available": True, "show_campaign": True, "claimable": False,
+     "campaign_url": "", "identity": "runtime-info", "campaigns": []},
+    (False, {"error": "nf"}), (False, "nf"), {"ok": True}, "")
+_acc23g = A.Account({"uid": "codes23", "realm": "cn", "accessToken": "dt-x"})
+_acc23g.campaign_codes = {"c-cup": "MT-1111-2222"}
+try:
+    _t23g, _s23g = T.fetch_task_view(_acc23g)
+finally:
+    T._fetch_upstream_parallel = _orig_ftv23
+check("summary.codes 按账号给出兑换码",
+      _s23g.get("codes") == [{"campaign": "c-cup", "code": "MT-1111-2222"}],
+      _s23g.get("codes"))
+
+print()
+print("[24] 全部账号视图：按活动聚合 + 每账号资格明细 + 多账号各自独立领取")
+# --- 24.1 聚合：能领的、名额发完的、无资格的三种账号同屏列出 ---
+_orig_camp24 = A.Account.campaigns
+_orig_native24 = A.native_machine_identity
+
+
+def _camp_for(uid):
+    base = {"ok": True, "available": True, "show_campaign": True,
+            "claimable": False, "campaign_url": "https://openapi.qoder.com.cn/growth-page/activity-iframe",
+            "identity": "runtime-info", "campaigns": []}
+    if uid == "a24":            # 有资格，可领
+        base["campaigns"] = [{"campaign_id": "c-cup", "campaign_key": "act-cup",
+                              "action_type": "CLAIM_BENEFIT", "claim_status": "CLAIMABLE",
+                              "start_at": 0, "end_at": 0,
+                              "benefit": {"kind": "REDEMPTION_CODE", "amount": 1},
+                              "required_achievement_key": "", "achievement_completed": True,
+                              "unavailable_reason": "", "placements": []}]
+    elif uid == "b24":          # 有资格但名额发完
+        base["campaigns"] = [{"campaign_id": "c-cup", "campaign_key": "act-cup",
+                              "action_type": "CLAIM_BENEFIT", "claim_status": "NOT_ELIGIBLE",
+                              "start_at": 0, "end_at": 0,
+                              "benefit": {"kind": "REDEMPTION_CODE", "amount": 1},
+                              "required_achievement_key": "", "achievement_completed": True,
+                              "unavailable_reason": "REDEMPTION_CODE_OUT_OF_STOCK",
+                              "placements": []}]
+    return base                    # c24：列表里没有该活动 = 无资格
+
+
+A.Account.campaigns = lambda self, force=False: _camp_for(self.uid[:3])
+A.native_machine_identity = lambda realm, uid, force=False: {
+    "machineToken": "t", "machineType": "ty", "machineCode": "c", "source": "runtime-info"}
+_a24 = A.Account({"uid": "a24", "realm": "cn", "accessToken": "dt-x", "nickname": "可领号"})
+_b24 = A.Account({"uid": "b24", "realm": "cn", "accessToken": "dt-x", "nickname": "补货号"})
+_c24 = A.Account({"uid": "c24", "realm": "cn", "accessToken": "dt-x", "nickname": "无资格号"})
+_b24.campaign_codes = {"c-cup": "MT-FROM-B24"}
+try:
+    _rows24, _codes24 = T.aggregate_campaign_rows([_a24, _b24, _c24])
+finally:
+    A.Account.campaigns = _orig_camp24
+    A.native_machine_identity = _orig_native24
+check("聚合为每个活动一行（3 个账号只出 1 行活动）",
+      len(_rows24) == 1 and _rows24[0]["task_code"] == "campaign:act-cup", _rows24)
+_desc24 = _rows24[0]["description"]
+check("描述里逐账号标注：可领/名额发完/无资格",
+      "可领 1/3：可领号" in _desc24 and "名额发完 1/3：补货号" in _desc24
+      and "无资格(不在定向) 1/3：无资格号" in _desc24, _desc24)
+check("聚合行状态：有可领账号 -> 待领奖",
+      _rows24[0]["status"] == "completed" and _rows24[0]["reward_text"] == "兑换码 ×1",
+      _rows24[0])
+check("聚合结果按账号收集已领兑换码",
+      _codes24 and _codes24[0]["code"] == "MT-FROM-B24"
+      and _codes24[0]["nickname"] == "补货号"
+      and _codes24[0]["realm"] == "cn", _codes24)
+
+# --- 24.2 关键语义：上游没返回 SAME_PERSON_ALREADY_CLAIMED -> 各账号都能领 ---
+_orig_camp24b = A.Account.campaigns
+_orig_claim24 = A.Account.claim_campaign
+_orig_native24b = A.native_machine_identity
+_calls24 = []
+
+
+def _camp_claimable24(self, force=False):
+    return {"ok": True, "available": True, "show_campaign": True, "claimable": True,
+            "campaign_url": "", "identity": "runtime-info",
+            "campaigns": [{"campaign_id": "c-cup-" + self.uid,
+                           "campaign_key": "act-cup",
+                           "action_type": "CLAIM_BENEFIT", "claim_status": "CLAIMABLE",
+                           "start_at": 0, "end_at": 0,
+                           "benefit": {"kind": "REDEMPTION_CODE", "amount": 1},
+                           "required_achievement_key": "", "achievement_completed": True,
+                           "unavailable_reason": "", "placements": []}]}
+
+
+def _claim_http24(url, **kw):
+    # 只打桩 HTTP 层：让真实的 claim_campaign（含兑换码提取/落盘）跑起来。
+    # 用 **kw 兼容合并后的生产签名（会额外传 account=self）。
+    headers = kw.get("headers") or {}
+    cid = url.rsplit("/", 2)[-2]
+    _calls24.append((headers.get("cosy-user", "?"), cid))
+    return {"status": "CLAIMED", "replayed": False, "grantId": "g-" + cid,
+            "redemptionCode": "CODE-" + cid.split("-")[-1],
+            "benefit": {"kind": "REDEMPTION_CODE", "amount": 1}}
+
+
+_orig_http24 = A.http_json
+A.Account.campaigns = _camp_claimable24
+A.http_json = _claim_http24
+A.native_machine_identity = lambda realm, uid, force=False: {
+    "machineToken": "t", "machineType": "ty", "machineCode": "c", "source": "runtime-info"}
+try:
+    _x24 = A.Account({"uid": "X24", "realm": "cn", "accessToken": "dt-x"})
+    _y24 = A.Account({"uid": "Y24", "realm": "cn", "accessToken": "dt-x"})
+    _rx24 = _x24.campaign_checkin(gap=0)
+    _ry24 = _y24.campaign_checkin(gap=0)
+finally:
+    A.Account.campaigns = _orig_camp24b
+    A.http_json = _orig_http24
+    A.native_machine_identity = _orig_native24b
+check("同机器两个账号：上游未判同人 -> 两个账号都发起领取",
+      [c[1] for c in _calls24] == ["c-cup-X24", "c-cup-Y24"], _calls24)
+check("各自拿到自己的兑换码（互不覆盖）",
+      _x24.campaign_codes.get("c-cup-X24") == "CODE-X24"
+      and _y24.campaign_codes.get("c-cup-Y24") == "CODE-Y24",
+      (_x24.campaign_codes, _y24.campaign_codes))
+check("两条都算领取成功（没有被我方预判拦截）",
+      _rx24["claimed"] and _ry24["claimed"]
+      and not _rx24["blocked"] and not _ry24["blocked"],
+      (_rx24.get("blocked"), _ry24.get("blocked")))
+
+print()
+print("[25] 活动中文名 / 每日签到只领积分 / 领取全部福利")
+# --- 25.1 中文名：官方标题优先，其次兜底表，最后 kind 兜底 ---
+check("campaign_title: 官方 content.zh.title 优先",
+      T.campaign_title({"title_zh": "发布 Qoder 站点，免费领取奶茶免单卡",
+                        "campaign_key": "act-x"}) == "发布 Qoder 站点，免费领取奶茶免单卡")
+check("campaign_title: 已知 key 走内置兜底",
+      T.campaign_title({"campaign_key": "act-20260928-620"})
+      == "新人任务：发布 Qoder 站点领奶茶免单卡", 
+      T.campaign_title({"campaign_key": "act-20260928-620"}))
+check("campaign_title: 前缀兜底（每日 100）",
+      T.campaign_title({"campaign_key": "act-20260930-999"}) == "每天领 100 Credits")
+check("campaign_title: 未知 key 按奖励类型兜底",
+      T.campaign_title({"campaign_key": "act-unknown-1",
+                        "benefit": {"kind": "REDEMPTION_CODE"}}) == "限时活动（兑换码）"
+      and T.campaign_title({"campaign_key": "act-unknown-2",
+                            "benefit": {"kind": "CREDITS"}}) == "限时活动（Credits）")
+
+# --- 25.2 账号面板「每日签到」只领积分：券类活动不被触碰 ---
+_orig_camp25 = A.Account.campaigns
+_orig_claim25 = A.Account.claim_campaign
+_orig_native25 = A.native_machine_identity
+_posts25 = []
+
+
+def _camp_mixed25(self, force=False):
+    return {"ok": True, "available": True, "show_campaign": True, "claimable": True,
+            "campaign_url": "", "identity": "runtime-info",
+            "campaigns": [
+                {"campaign_id": "c-daily", "campaign_key": "act-daily",
+                 "title_zh": "每天领 100 Credits",
+                 "action_type": "CLAIM_BENEFIT", "claim_status": "CLAIMABLE",
+                 "start_at": 0, "end_at": 0,
+                 "benefit": {"kind": "CREDITS", "amount": 100},
+                 "required_achievement_key": "", "achievement_completed": True,
+                 "unavailable_reason": "", "placements": []},
+                {"campaign_id": "c-cup", "campaign_key": "act-cup",
+                 "title_zh": "发布 Qoder 站点，免费领取奶茶免单卡",
+                 "action_type": "CLAIM_BENEFIT", "claim_status": "CLAIMABLE",
+                 "start_at": 0, "end_at": 0,
+                 "benefit": {"kind": "REDEMPTION_CODE", "amount": 1},
+                 "required_achievement_key": "", "achievement_completed": True,
+                 "unavailable_reason": "", "placements": []}]}
+
+
+def _claim_spy25(self, campaign_id):
+    _posts25.append(campaign_id)
+    return {"ok": True, "status": "CLAIMED", "replayed": False, "amount": 100,
+            "redemption_code": "CODE-1" if "cup" in campaign_id else "",
+            "message": "领取成功"}
+
+
+A.Account.campaigns = _camp_mixed25
+A.Account.claim_campaign = _claim_spy25
+A.native_machine_identity = lambda realm, uid, force=False: {
+    "machineToken": "t", "machineType": "ty", "machineCode": "c", "source": "runtime-info"}
+try:
+    _acc25 = A.Account({"uid": "daily25", "realm": "cn", "accessToken": "dt-x"})
+    _r_daily = _acc25.campaign_checkin(gap=0, only_kinds=("", "CREDITS"))
+    _posts25.clear()
+    _r_all = _acc25.campaign_checkin(gap=0)
+finally:
+    A.Account.campaigns = _orig_camp25
+    A.Account.claim_campaign = _orig_claim25
+    A.native_machine_identity = _orig_native25
+check("only_kinds=CREDITS：只领每日积分，不碰券类活动",
+      _r_daily["claimed"] and len(_r_daily["claimed"]) == 1
+      and _r_daily["claimed"][0]["campaign_key"] == "act-daily", _r_daily.get("claimed"))
+check("不带 only_kinds：积分与券类都领",
+      [c["campaign_key"] for c in _r_all["claimed"]] == ["act-daily", "act-cup"],
+      [c["campaign_key"] for c in _r_all["claimed"]])
+
+# --- 25.3 面板/接口接线：账号面板走 only_daily，福利中心走全量 ---
+_src25 = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "qoder_proxy.py"), encoding="utf-8").read()
+check("账号面板 /accounts/checkin 只做每日签到",
+      "run_checkin(account, gap=0.4, only_daily=True)" in _src25)
+check("签到与福利中心 /tasks/run 仍是全量领取",
+      "run_batch_checkin(targets, gap=1.0)" in _src25)
+_dash25 = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "dashboard.html"), encoding="utf-8").read()
+check("按钮文案：领取全部福利 / 仅领 Pro 福利包",
+      ">领取全部福利<" in _dash25 and ">仅领 Pro 福利包<" in _dash25
+      and "一键签到领积分" not in _dash25)
+check("领取全部福利 = 活动全量 + Pro 福利包（run + travel）",
+      'postJSON("/tasks/run"' in _dash25 and 'postJSON("/tasks/travel"' in _dash25)
+
+print()
+print("[26] PR#7 合并回归：信封层 403(10605 排队) -> 账号冷却 + 解绑 + 轮换")
+class _Aff26:
+    def __init__(self): self.calls = []
+    def unbind(self, key): self.calls.append(key)
+class _Pool26:
+    def __init__(self):
+        self.affinity = _Aff26(); self.accounts = [1, 2, 3]
+class _Acc26:
+    def __init__(self):
+        self.uid = "pr7acc12"; self.enabled = True; self.notes = []; self.saved = 0
+        self.path = ""
+    def note_error(self, msg, cooldown=60, single_account=False, model=None, until=None):
+        self.notes.append({"msg": str(msg)[:60], "cooldown": cooldown, "model": model})
+    def save(self, d): self.saved += 1
+class _UpErr26(Exception):
+    def __init__(self, status, detail):
+        self.status = status; self.detail = detail
+
+_orig_pool26 = P.POOL
+_acc26 = _Acc26()
+P.POOL = _Pool26()
+P.ACCOUNTS_DIR = os.environ["ACCOUNTS_DIR"]
+try:
+    P._handle_envelope_account_cooldown(_acc26, _UpErr26(
+        403, '{"code":"10605","message":"{\"isQueued\":true,\"retryAfterSeconds\": 30}"}'),
+        model="qfmodel", session_key="sk-pr7")
+    _n1 = _acc26.notes[-1]
+    P._handle_envelope_account_cooldown(_acc26, _UpErr26(403, "permission denied"),
+                                        model="qfmodel", session_key="sk-pr7")
+    _n2 = _acc26.notes[-1]
+    P._handle_envelope_account_cooldown(_acc26, _UpErr26(429, "rate limit"),
+                                        model="qfmodel", session_key="sk-pr7")
+    _n3 = _acc26.notes[-1]
+    _acc26.enabled = True
+    P._handle_envelope_account_cooldown(_acc26, _UpErr26(401, "TOKEN_EXPIRE session dead"),
+                                        model=None, session_key="sk-pr7")
+    _n4 = _acc26.notes[-1]
+    _aff26_calls = list(P.POOL.affinity.calls)
+finally:
+    P.POOL = _orig_pool26
+check("10605 排队 -> 模型级冷却 30s（按上游 retryAfterSeconds）+ 解绑会话",
+      _n1["cooldown"] == 30 and _n1["model"] == "qfmodel"
+      and set(_aff26_calls) == {"sk-pr7"} and len(_aff26_calls) >= 1,
+      (_n1, _aff26_calls))
+check("403 非排队 -> 账号级冷却 60s", _n2["cooldown"] == 60 and _n2["model"] is None, _n2)
+check("429 -> 模型级冷却 30s", _n3["cooldown"] == 30 and _n3["model"] == "qfmodel", _n3)
+check("死会话 -> 300s + 停用账号（与 open_upstream 同语义）",
+      _acc26.enabled is False and _n4["cooldown"] == 300, _n4)
+for st, detail, want in ((403, "10605", True), (401, "x", True), (429, "x", True),
+                         (418, "DataInspectionFailed", False),
+                         (400, "invalid_parameter_error", False), (500, "x", True)):
+    got = P.should_retry_envelope(P.UpstreamStatus(st, detail), False, 0)
+    check("未吐字节可重开：%s -> %s" % (st, want), got is want, (st, got))
+_src26 = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "qoder_proxy.py"), encoding="utf-8").read()
+check("三处信封捕获点都接入账号冷却",
+      _src26.count("_handle_envelope_account_cooldown(") >= 4,
+      _src26.count("_handle_envelope_account_cooldown("))
+print("[27] 账号级 IP 代理：URL 解析 / 脱敏 / 隧道握手 / fail-closed / 熔断")
+
+# --- 27.1 URL 解析 ----------------------------------------------------------
 check("空代理 -> None", N.parse_proxy_url("") is None)
 check("空白代理 -> None", N.parse_proxy_url("   ") is None)
 _p = N.parse_proxy_url("socks5h://alice:s3cr3t@1.2.3.4:1080")
@@ -2061,7 +2527,7 @@ for _bad in ("1.2.3.4:1080", "ftp://h:1", "http://h", "http://:1080",
         _raised = True
     check("非法代理被拒绝: %r" % _bad, _raised)
 
-# --- 30.2 脱敏（日志/看板绝不出现明文凭据） --------------------------------
+# --- 27.2 脱敏（日志/看板绝不出现明文凭据） --------------------------------
 _masked = N.parse_proxy_url("socks5h://alice:s3cr3t@1.2.3.4:1080").mask()
 check("脱敏串不含密码", "s3cr3t" not in _masked, _masked)
 check("脱敏串不含完整用户名", "alice" not in _masked, _masked)
@@ -2070,7 +2536,7 @@ check("脱敏串保留 scheme/host/port",
 check("mask_proxy 对原始串脱敏", "s3cr3t" not in N.mask_proxy("http://u:s3cr3t@h:8080"))
 check("mask_proxy 空串 -> 空", N.mask_proxy("") == "")
 
-# --- 30.3 is_proxy_error / error_text --------------------------------------
+# --- 27.3 is_proxy_error / error_text --------------------------------------
 check("ProxyTunnelError 被识别", N.is_proxy_error(N.ProxyTunnelError("x", "auth")))
 check("ProxyPausedError 被识别", N.is_proxy_error(N.ProxyPausedError("paused")))
 check("URLError 包装的代理错误被识别",
@@ -2081,7 +2547,7 @@ check("HTTPError 不被误判为代理错误",
 check("error_text 剥掉 URLError 包装",
       "boom" in N.error_text(urllib.error.URLError(N.ProxyTunnelError("boom"))))
 
-# --- 30.4 隧道握手（离线：用假 socket 注入脚本） ----------------------------
+# --- 27.4 隧道握手（离线：用假 socket 注入脚本） ----------------------------
 class _FakeSock(object):
     """按脚本吐出 recv 数据、记录 sendall 字节的假 socket。"""
 
@@ -2191,7 +2657,7 @@ except N.ProxyTunnelError as _exc:
 check("代理不可达 -> ProxyTunnelError(connect)，不回退直连",
       _eu is not None and _eu.stage == "connect", str(_eu))
 
-# --- 30.5 opener 零直连出口（关键防泄漏保证） ------------------------------
+# --- 27.5 opener 零直连出口（关键防泄漏保证） ------------------------------
 _op = N.build_opener(N.parse_proxy_url("socks5h://u:p@1.2.3.4:1080"))
 _handlers = {type(h).__name__ for h in set(
     h for lst in _op.handle_open.values() for h in lst)}
@@ -2222,7 +2688,7 @@ finally:
 check("环境变量 HTTP(S)_PROXY 不能接管账号代理 opener", _env_ignored)
 check("open_url(None, ...) 走原直连路径", N.open_url.__doc__ is not None)
 
-# --- 30.6 Account 代理字段 / fail-closed / 熔断 -----------------------------
+# --- 27.6 Account 代理字段 / fail-closed / 熔断 -----------------------------
 _a = A.Account({"uid": "px1", "realm": "cn", "accessToken": "dt-x",
                 "proxy": "socks5h://u:p@1.2.3.4:1080"})
 check("Account 读取 proxy 字段", _a.proxy == "socks5h://u:p@1.2.3.4:1080")
@@ -2296,7 +2762,7 @@ check("set_proxy 接受合法配置", _d.proxy == "http://u:p@h:8080")
 _d.set_proxy("")
 check("set_proxy 空串 = 清空为直连", _d.proxy == "")
 
-# --- 30.7 http_json 代理接入：失败熔断且不直连 ------------------------------
+# --- 27.7 http_json 代理接入：失败熔断且不直连 ------------------------------
 _e = A.Account({"uid": "px5", "realm": "cn", "accessToken": "dt-x",
                 "proxy": "socks5h://u:p@127.0.0.1:9"})
 _proxy_raised = False
@@ -2314,7 +2780,7 @@ check("代理失败原因已记录且脱敏", "127.0.0.1:9" in _e.proxy_last_err
 check("http_json 无账号时保持直连语义（opener=None 不报错路径）",
       A.http_json.__doc__ is not None)
 
-# --- 30.8 导入/导出携带代理 ------------------------------------------------
+# --- 27.8 导入/导出携带代理 ------------------------------------------------
 _row = A.normalise_import_row({"accessToken": "dt-z", "uid": "imp1", "realm": "cn",
                                "proxy": "socks5h://u:p@1.2.3.4:1080"})
 check("导入行读取 proxy", _row["proxy"] == "socks5h://u:p@1.2.3.4:1080")
@@ -2359,7 +2825,7 @@ with _tempfile.TemporaryDirectory() as _td:
     check("AccountPool.set_proxy 拒绝非法配置", _pool_raised)
     check("AccountPool.set_proxy 未知 uid -> None", _pool.set_proxy("nope", "x") is None)
 
-# --- 30.9 网关侧识别代理错误并给出独立错误类型 -------------------------------
+# --- 27.9 网关侧识别代理错误并给出独立错误类型 -------------------------------
 # friendly_upstream_error 处理上游错误；代理错误另走 proxy_error 分支（见
 # qoder_proxy 的 chat 处理器）。这里验证分类函数不把代理错误误判成上游瞬时故障，
 # 否则会触发"换域名重试"这种对死代理毫无意义的动作。
