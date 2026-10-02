@@ -2838,5 +2838,33 @@ check("代理错误文本用于客户端提示（脱敏后）",
       "连接代理失败" in N.error_text(_proxy_exc))
 
 print()
+print("[28] Dockerfile COPY 白名单覆盖全部运行时模块（含新增模块）")
+# 教训：qoder_net.py 曾漏出 COPY 白名单，本地跑得好好的、Docker 起来就
+# ModuleNotFoundError。这条把"运行时 import 到的本地模块"与 COPY 清单对齐，
+# 新增模块忘加 Dockerfile 时离线测试直接红。
+import re as _re
+_df = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "Dockerfile"), encoding="utf-8").read()
+_df_flat = _df.replace("\\\n", " ")          # 反斜杠续行拼平
+_copied = set()
+for _m in _re.finditer(r"^COPY\s+(.+)$", _df_flat, _re.M):
+    _copied.update(x.strip() for x in _m.group(1).split())
+_runtime = set()
+for _f in ("qoder_proxy.py", "qoder_accounts.py", "qoder_tasks.py",
+           "qoder_scheduler.py", "qoder_catalog.py"):
+    _src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), _f),
+                encoding="utf-8").read()
+    _runtime.update(_re.findall(r"^\s*(?:import|from)\s+(qoder_\w+)", _src,
+                                _re.M))
+_runtime = {m + ".py" for m in _runtime}
+_missing = _runtime - _copied
+check("运行时 import 的本地模块都在 COPY 清单里", not _missing,
+      sorted(_missing) or _copied)
+check("Docker 镜像带看板与请求体模板",
+      {"dashboard.html", "baseprompt.json"} <= _copied)
+check("Docker 镜像带双区模型快照",
+      {"qoder_catalog_intl.json", "qoder_catalog_cn.json"} <= _copied)
+
+print()
 print("SUMMARY: PASS=%d FAIL=%d" % (PASS, FAIL))
 sys.exit(1 if FAIL else 0)
