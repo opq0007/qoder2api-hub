@@ -30,6 +30,7 @@ import uuid
 from qoder_fingerprint import (derive_id, generate_request_id,
                                derive_machine_token, derive_machine_type,
                                vm_status)
+import qoder_net
 
 # ---------------------------------------------------------------------------
 # 区域常量（逆向自官方桌面/CLI 客户端）
@@ -352,13 +353,17 @@ def _host_boundary_violation(ip, allow_local):
     return False
 
 
-def validate_public_http_url(url, allow_local=False):
+def validate_public_http_url(url, allow_local=False, resolve=True):
     """SSRF 防护：仅允许 http/https，且 host 不得指向本机/私有/保留网段。
 
     上游网关与 openapi 域名均为公网地址；任何指向 localhost、回环、内网或
     保留地址的 URL 一律拒绝，防止上游配置或导入数据把请求引向内网。
     allow_local 仅供显式面向本机网关的开发/验证脚本开启（如 _verify_models.py），
     服务端请求路径一律使用默认 False。
+
+    resolve=False：跳过本地 DNS 解析级校验（仅名称级校验）。账号配置了代理时
+    必须传 False——本地 getaddrinfo 会向本机解析器暴露"在查哪个域名"，与代理
+    的防泄漏目标冲突；域名由代理远端解析（socks5h/CONNECT 语义）。
     """
     parsed = urllib.parse.urlsplit(str(url or ""))
     if parsed.scheme not in ("http", "https"):
@@ -378,6 +383,8 @@ def validate_public_http_url(url, allow_local=False):
         if _host_boundary_violation(literal, allow_local):
             raise ValueError(
                 "requests to private/reserved address %s are not allowed" % literal)
+        return url
+    if not resolve:
         return url
     port = parsed.port or (443 if parsed.scheme == "https" else 80)
     try:
@@ -414,9 +421,16 @@ def _retryable(exc):
 
 
 def http_json(url, data=None, method=None, headers=None, timeout=30,
-              retries=3, backoff=1.0, log=None):
-    """urlopen + json decode with retries. 所有 openapi 调用统一走这里。"""
-    validate_public_http_url(url)
+              retries=3, backoff=1.0, log=None, opener=None, account=None):
+    """urlopen + json decode with retries. 所有 openapi 调用统一走这里。
+
+    account 给出时：请求经该账号的代理 opener（未配代理则原样直连），
+    并自动维护代理熔断计数（见 Account.note_proxy_failure）。代理隧道失败
+    **不做重试**、绝不回退直连——立即以 ProxyTunnelError 失败给调用方。
+    """
+    if account is not None:
+        opener = account.net_opener()   # 熔断暂停时在此快速失败（未出网）
+    validate_public_http_url(url, resolve=(opener is None))
     attempts = max(1, int(retries or 1))
     last = None
     for attempt in range(1, attempts + 1):
@@ -427,10 +441,17 @@ def http_json(url, data=None, method=None, headers=None, timeout=30,
             headers=headers or {},
         )
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                return json.loads(resp.read().decode("utf-8"))
+            with qoder_net.open_url(opener, req, timeout=timeout) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+            if account is not None:
+                account.note_proxy_success()
+            return payload
         except Exception as exc:
             last = exc
+            if account is not None and qoder_net.is_proxy_error(exc):
+                text = qoder_net.error_text(exc)
+                account.note_proxy_failure(text)
+                raise qoder_net.ProxyTunnelError(text)
             if attempt >= attempts or not _retryable(exc):
                 break
             if log:
@@ -442,6 +463,11 @@ def http_json(url, data=None, method=None, headers=None, timeout=30,
 # ---------------------------------------------------------------------------
 # Account
 # ---------------------------------------------------------------------------
+# 代理熔断阈值：连续失败达此次数自动停用账号（fail-closed；既防后台调度器
+# 反复空打死代理，也杜绝任何"回退直连"的诱惑）。看板重新启用即清零恢复。
+PROXY_PAUSE_THRESHOLD = 5
+
+
 class Account(object):
     def __init__(self, data, path=None):
         data = data or {}
@@ -484,6 +510,13 @@ class Account(object):
         self._campaigns_cache = None
         # 活动平台用的机器身份来源：native(官方原生桥) / derived(派生回退)
         self.machine_identity_source = "derived"
+        # 账号级 IP 代理（单行 URL，如 socks5h://user:pass@1.2.3.4:1080）：
+        # 配置后该账号的全部上游流量（推理/刷新/签到/额度/活动/登录…）都走
+        # 代理，隧道失败绝不回退直连（fail-closed）；连续失败达阈值自动暂停。
+        self.proxy = str(data.get("proxy") or "").strip()
+        self.proxy_failures = int(data.get("proxyFailures") or 0)
+        self.proxy_last_error = str(data.get("proxyLastError") or "")
+        self._opener_cache = None
 
     # -- 持久化 ------------------------------------------------------------
     def to_dict(self):
@@ -508,6 +541,9 @@ class Account(object):
             "userType": self.user_type,
             "organizationId": self.organization_id,
             "organizationName": self.organization_name,
+            "proxy": self.proxy,
+            "proxyFailures": self.proxy_failures,
+            "proxyLastError": self.proxy_last_error,
         }
 
     def public(self):
@@ -542,6 +578,7 @@ class Account(object):
             "userType": self.user_type,
             "machineId": derive_id(self.uid, "machine"),
             "sessionId": derive_id(self.uid, "session"),
+            "proxy": self.proxy_public(),
         }
 
     def save(self, directory):
@@ -607,11 +644,95 @@ class Account(object):
     def clear_error(self, model=None):
         if model:
             self.model_cooldowns.pop(model, None)
-        else:
-            self.model_cooldowns.clear()
+            return
+        self.model_cooldowns.clear()
+        # 重新启用账号 = 管理动作，代理熔断计数一并清零（重新给代理机会）
+        self.proxy_failures = 0
+        self.proxy_last_error = ""
         if self.last_error or self.cooldown_until:
             self.last_error = ""
             self.cooldown_until = 0
+
+    # -- 账号级 IP 代理（fail-closed） --------------------------------------
+    def net_opener(self):
+        """账号出站 opener：配置代理则返回全隧道 opener，否则 None（直连）。
+
+        代理连续失败达到阈值（熔断）时抛 ProxyPausedError——请求未出网即失败，
+        绝不静默回退直连。结果按当前 proxy 字符串缓存，改配置即时生效。
+        """
+        if not self.proxy:
+            return None
+        if self.proxy_failures >= PROXY_PAUSE_THRESHOLD:
+            raise qoder_net.ProxyPausedError(
+                "账号已因代理连续失败 %d 次自动暂停：%s（在看板重新启用该账号可重试）"
+                % (self.proxy_failures, qoder_net.mask_proxy(self.proxy)))
+        hit = self._opener_cache
+        if hit is not None and hit[0] == self.proxy:
+            return hit[1]
+        pcfg = qoder_net.parse_proxy_url(self.proxy)   # 非法配置：ValueError 上抛
+        opener = qoder_net.build_opener(pcfg)
+        self._opener_cache = (self.proxy, opener)
+        return opener
+
+    def note_proxy_failure(self, message=""):
+        """记录一次代理隧道失败；达到阈值自动暂停账号（fail-closed）。"""
+        self.proxy_failures = int(self.proxy_failures or 0) + 1
+        self.proxy_last_error = str(message or "")[:200]
+        if self.proxy_failures >= PROXY_PAUSE_THRESHOLD and self.enabled:
+            self.enabled = False
+            self.last_error = ("代理不可达，已自动暂停（连续 %d 次失败，绝不回退直连）：%s"
+                               % (self.proxy_failures,
+                                  qoder_net.mask_proxy(self.proxy)))
+            self.cooldown_until = 0
+        if self.path and os.path.exists(os.path.dirname(self.path)):
+            self.save(os.path.dirname(self.path))
+
+    def note_proxy_success(self):
+        """代理链路恢复：清零熔断计数（仅状态变化时落盘）。"""
+        if not self.proxy_failures and not self.proxy_last_error:
+            return
+        self.proxy_failures = 0
+        self.proxy_last_error = ""
+        if self.path and os.path.exists(os.path.dirname(self.path)):
+            self.save(os.path.dirname(self.path))
+
+    def proxy_public(self):
+        """看板展示用代理摘要（脱敏，绝不含凭据明文）。"""
+        if not self.proxy:
+            return {"set": False, "failures": 0, "paused": False}
+        try:
+            pcfg = qoder_net.parse_proxy_url(self.proxy)
+        except ValueError as exc:
+            return {"set": True, "invalid": str(exc)[:120], "masked": "",
+                    "failures": self.proxy_failures,
+                    "paused": self.proxy_failures >= PROXY_PAUSE_THRESHOLD}
+        return {"set": True, "scheme": pcfg.scheme, "host": pcfg.host,
+                "port": pcfg.port, "hasAuth": bool(pcfg.username),
+                "masked": pcfg.mask(), "invalid": "",
+                "failures": self.proxy_failures,
+                "paused": self.proxy_failures >= PROXY_PAUSE_THRESHOLD}
+
+    def set_proxy(self, value):
+        """设置/清空账号代理（空串 = 直连）。非法配置抛 ValueError 且不改动。
+
+        改配置即重置熔断计数与缓存 opener（下个请求立即用新配置）。
+        """
+        value = str(value or "").strip()
+        if value:
+            qoder_net.parse_proxy_url(value)   # 校验；非法直接抛
+        self.proxy = value
+        self.proxy_failures = 0
+        self.proxy_last_error = ""
+        self._opener_cache = None
+        return self.proxy
+
+    def _native_identity(self, force=False):
+        """活动平台机器身份：代理账号跳过官方原生桥（runtime-info.exe 会用
+        宿主机真实 IP 直连官方，网关管不到它的流量），一律用派生身份。
+        """
+        if self.proxy:
+            return {"source": "derived"}
+        return native_machine_identity(self.realm, self.uid, force=force)
 
     # -- 出站头 ------------------------------------------------------------
     def headers(self, purpose="openapi"):
@@ -649,7 +770,8 @@ class Account(object):
         h["User-Agent"] = "Qoder"
         h["cosy-clienttype"] = DESKTOP_CLIENT_TYPE
         h["cosy-version"] = desktop_version()
-        ident = native_machine_identity(self.realm, self.uid)
+        # 代理账号跳过原生桥（防宿主机 IP 经官方二进制泄漏），用派生身份。
+        ident = self._native_identity()
         h["cosy-machineid"] = derive_id(self.uid, "machine")
         h["cosy-machinetoken"] = ident.get("machineToken") or \
             derive_machine_token(self.uid)
@@ -695,7 +817,7 @@ class Account(object):
         }
         try:
             data = http_json(url, data=json.dumps(payload).encode(), method="POST",
-                             headers=headers, timeout=30)
+                             headers=headers, timeout=30, account=self)
         except urllib.error.HTTPError as exc:
             try:
                 body = exc.read().decode("utf-8", "replace")
@@ -777,7 +899,7 @@ class Account(object):
         url = cfg["openapi"] + PATH_CHECKIN_STATUS
         try:
             q = http_json(url, method="GET", headers=self.headers(), timeout=15,
-                          retries=2)
+                          retries=2, account=self)
         except urllib.error.HTTPError as exc:
             try:
                 body = exc.read().decode("utf-8", "replace")
@@ -846,7 +968,8 @@ class Account(object):
         url = cfg["openapi"] + PATH_CHECKIN_CLAIM
         try:
             res = http_json(url, data=b"{}", method="POST",
-                            headers=self.headers(), timeout=15, retries=1)
+                            headers=self.headers(), timeout=15, retries=1,
+                            account=self)
         except urllib.error.HTTPError as exc:
             try:
                 body = exc.read().decode("utf-8", "replace")
@@ -882,7 +1005,7 @@ class Account(object):
         url = get_realm_config(self.realm)["openapi"] + PATH_CAMPAIGNS
         try:
             return http_json(url, method="GET", headers=self.desktop_headers(),
-                             timeout=15, retries=1), 200, ""
+                             timeout=15, retries=1, account=self), 200, ""
         except urllib.error.HTTPError as exc:
             try:
                 body = exc.read().decode("utf-8", "replace")
@@ -892,7 +1015,7 @@ class Account(object):
             if exc.code in (401, 403):
                 try:
                     return http_json(url, method="GET", headers=self.headers(),
-                                     timeout=15, retries=1), 200, ""
+                                     timeout=15, retries=1, account=self), 200, ""
                 except urllib.error.HTTPError as exc2:
                     return None, exc2.code, ("HTTP %d (desktop) / HTTP %d (plain)"
                                              % (exc.code, exc2.code))
@@ -976,7 +1099,7 @@ class Account(object):
         url = cfg["openapi"] + (PATH_CAMPAIGN_REWARD % campaign_id)
         try:
             return http_json(url, method="GET", headers=self.desktop_headers(),
-                             timeout=20, retries=1)
+                             timeout=20, retries=1, account=self)
         except Exception as exc:
             return {"error": str(exc)}
 
@@ -994,7 +1117,8 @@ class Account(object):
         url = cfg["openapi"] + (PATH_CAMPAIGN_CLAIM % campaign_id)
         try:
             r = http_json(url, data=b"{}", method="POST",
-                          headers=self.desktop_headers(), timeout=20, retries=1)
+                          headers=self.desktop_headers(), timeout=20, retries=1,
+                          account=self)
         except urllib.error.HTTPError as exc:
             try:
                 body = exc.read().decode("utf-8", "replace")
@@ -1046,7 +1170,10 @@ class Account(object):
           - 已是 CLAIMED 的活动计入 already（"今日已领取"）
           - 无可领取项且没有任何活动 -> ok=True + message 说明
         """
-        native_machine_identity(self.realm, self.uid, force=True)
+        # 代理账号跳过原生桥（防宿主机 IP 泄漏）；派生身份下"设备定向"活动
+        # 可能被服务端过滤，但常规 Credits 领取不受影响。
+        if not self.proxy:
+            native_machine_identity(self.realm, self.uid, force=True)
         st = self.campaigns(force=True)      # 领取路径必须绕过缓存，看最新状态
         if not st.get("ok"):
             return {"ok": False, "error": st.get("error") or "campaigns 查询失败",
@@ -1108,7 +1235,8 @@ class Account(object):
         cfg = get_realm_config(self.realm)
         url = cfg["openapi"] + PATH_QUOTA
         try:
-            q = http_json(url, method="GET", headers=self.headers(), timeout=30)
+            q = http_json(url, method="GET", headers=self.headers(), timeout=30,
+                          account=self)
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
         uq = q.get("userQuota") or {}
@@ -1149,7 +1277,7 @@ class Account(object):
         url = cfg["openapi"] + PATH_PLAN
         try:
             p = http_json(url, method="GET", headers=self.headers(), timeout=15,
-                          retries=1)
+                          retries=1, account=self)
         except Exception:
             return self.plan
         name = str(p.get("plan_tier_name") or p.get("user_type") or "")
@@ -1165,7 +1293,7 @@ class Account(object):
         url = cfg["openapi"] + PATH_PRO_ELIGIBILITY
         try:
             m = http_json(url, method="GET", headers=self.headers(), timeout=15,
-                          retries=1)
+                          retries=1, account=self)
             return True, bool(m.get("eligible"))
         except urllib.error.HTTPError as exc:
             if exc.code in (404, 403, 410):
@@ -1180,7 +1308,7 @@ class Account(object):
         url = cfg["openapi"] + PATH_PRO_CLAIM
         try:
             m = http_json(url, data=b"{}", method="POST", headers=self.headers(),
-                          timeout=15, retries=1)
+                          timeout=15, retries=1, account=self)
         except urllib.error.HTTPError as exc:
             try:
                 body = exc.read().decode("utf-8", "replace")
@@ -1350,6 +1478,10 @@ class AccountPool(object):
                     account.last_checkin = existing.last_checkin
                 if not account.personal_token and existing.personal_token:
                     account.personal_token = existing.personal_token
+                # 导入行未带代理时保留原配置，避免覆盖导入把代理弄丢
+                if not account.proxy and existing.proxy:
+                    account.proxy = existing.proxy
+                    account.proxy_failures = existing.proxy_failures
                 self.accounts[self.accounts.index(existing)] = account
             else:
                 self.accounts.append(account)
@@ -1433,6 +1565,19 @@ class AccountPool(object):
                     account.clear_error()
                 account.save(self.dir)
 
+    def set_proxy(self, uid, proxy):
+        """设置/清空某账号的 IP 代理（空串 = 直连）。返回 public() 或 None。
+
+        set_proxy 会清零熔断计数；若账号是被代理熔断暂停的，看板可随后
+        重新启用（或直接改配置，两者都让新配置立刻生效）。
+        """
+        account = self.get(uid)
+        if account is None:
+            return None
+        account.set_proxy(proxy)      # 非法配置抛 ValueError
+        account.save(self.dir)
+        return account.public()
+
     # -- 导入 / 导出 -------------------------------------------------------
     def preview_import_rows(self, rows, realm=None, overwrite=False):
         """报告 import_rows() 会做什么，不触碰账号池（Dry-Run）。"""
@@ -1511,7 +1656,7 @@ class AccountPool(object):
             pass
         return str(uuid.uuid4())
 
-    def start_login(self, realm="cn", platform="CLI"):
+    def start_login(self, realm="cn", platform="CLI", proxy=""):
         """构造 PKCE 设备授权 URL（浏览器打开完成授权）。
 
         双区 URL 参数差异（官方逆向）：
@@ -1519,8 +1664,15 @@ class AccountPool(object):
                  client_id, machine_id
           Intl : challenge, challenge_method, nonce(32-hex), client_id,
                  machine_id（新协议带 client_id/machine_id、不带 redirect_uri）
+
+        proxy：账号级 IP 代理（单行 URL）。device code 申请与后续轮询都走它，
+        新账号从第一笔网关侧网络请求起就在代理出口上。
         """
         cfg = get_realm_config(realm)
+        proxy = str(proxy or "").strip()
+        if proxy:
+            # 格式先校验（ValueError 上抛给看板），坏代理不该进到授权环节
+            qoder_net.parse_proxy_url(proxy)
         verifier, challenge = _make_pkce()
         nonce = uuid.uuid4().hex if not cfg["nonce_dashed"] else str(uuid.uuid4())
         q = {
@@ -1542,6 +1694,7 @@ class AccountPool(object):
                 "nonce": nonce,
                 "region": realm,
                 "platform": platform,
+                "proxy": proxy,
             }
         return {"state": state, "authUrl": auth_url, "realm": realm,
                 "platform": platform}
@@ -1565,13 +1718,14 @@ class AccountPool(object):
             "challenge_method": "S256",
         })
         url = cfg["openapi"] + PATH_DEVICE_POLL + "?" + q
-        validate_public_http_url(url)
+        opener = _login_opener(info.get("proxy"))
+        validate_public_http_url(url, resolve=opener is None)
         req = urllib.request.Request(url, method="GET", headers={
             "Accept": "application/json",
             "User-Agent": "QoderWork",
         })
         try:
-            with urllib.request.urlopen(req, timeout=20) as resp:
+            with qoder_net.open_url(opener, req, timeout=20) as resp:
                 raw = resp.read().decode("utf-8")
                 status = resp.status
         except urllib.error.HTTPError as exc:
@@ -1585,6 +1739,11 @@ class AccountPool(object):
                 body = ""
             return {"status": "error", "message": "poll http %d %s" % (exc.code, body[:160])}
         except Exception as exc:
+            if qoder_net.is_proxy_error(exc):
+                # 代理故障是确定性的：继续轮询只会一直 pending，直接终态报错
+                return {"status": "error",
+                        "message": "代理不可达，无法轮询授权状态：%s"
+                                   % qoder_net.error_text(exc)}
             return {"status": "pending", "message": "poll error: %s" % exc}
         if status in (404, 202):
             return {"status": "pending", "message": "等待浏览器完成 Qoder 设备授权"}
@@ -1601,13 +1760,13 @@ class AccountPool(object):
         # 拉取 userinfo 补全昵称/用户类型（尽力而为，不阻塞入库）
         try:
             ui_url = cfg["openapi"] + PATH_USERINFO
-            validate_public_http_url(ui_url)
+            validate_public_http_url(ui_url, resolve=opener is None)
             req_ui = urllib.request.Request(ui_url, method="GET", headers={
                 "Accept": "application/json",
                 "User-Agent": CLIENT_UA,
                 "Authorization": "Bearer " + token,
             })
-            with urllib.request.urlopen(req_ui, timeout=15) as resp_ui:
+            with qoder_net.open_url(opener, req_ui, timeout=15) as resp_ui:
                 ui = json.loads(resp_ui.read().decode("utf-8"))
             uid = str(ui.get("id") or uid)
             nickname = str(ui.get("name") or "")
@@ -1631,6 +1790,7 @@ class AccountPool(object):
             "userType": user_type,
             "organizationId": org_id,
             "organizationName": org_name,
+            "proxy": info.get("proxy") or "",
         })
         self.add(account)
         with self._lock:
@@ -1642,29 +1802,43 @@ class AccountPool(object):
             return self.logins.pop(state, None) is not None
 
     # -- PAT 导入 ----------------------------------------------------------
-    def import_pat(self, pat, realm="cn"):
-        """导入 pt- 个人访问令牌：交换 jobToken 并拉取身份后入库。"""
+    def import_pat(self, pat, realm="cn", proxy=""):
+        """导入 pt- 个人访问令牌：交换 jobToken 并拉取身份后入库。
+
+        proxy：账号级 IP 代理。PAT 交换与 userinfo 全程走代理——这是严格
+        防泄漏场景的推荐入口（没有浏览器授权那一步的宿主机 IP 暴露）。
+        """
         pat = str(pat or "").strip()
         if not pat.startswith("pt-"):
             raise ValueError("PAT must start with pt-")
+        proxy = str(proxy or "").strip()
+        opener = _login_opener(proxy)
         cfg = get_realm_config(realm)
-        data = http_json(cfg["openapi"] + PATH_JOB_EXCHANGE,
-                         data=json.dumps({"personal_token": pat}).encode(),
-                         method="POST",
-                         headers={"Content-Type": "application/json",
-                                  "Accept": "application/json",
-                                  "User-Agent": CLIENT_UA},
-                         timeout=30)
+        url = validate_public_http_url(cfg["openapi"] + PATH_JOB_EXCHANGE,
+                                       resolve=opener is None)
+        req = urllib.request.Request(
+            url, data=json.dumps({"personal_token": pat}).encode(),
+            method="POST",
+            headers={"Content-Type": "application/json",
+                     "Accept": "application/json",
+                     "User-Agent": CLIENT_UA})
+        with qoder_net.open_url(opener, req, timeout=30) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
         token = data.get("token") or ""
         if not token:
             raise ValueError("jobToken exchange returned no token")
         uid, nickname, user_type, org_id, org_name = "", "", DEFAULT_USER_TYPE, "", ""
         try:
-            ui = http_json(cfg["openapi"] + PATH_USERINFO, method="GET",
-                           headers={"Accept": "application/json",
-                                    "User-Agent": CLIENT_UA,
-                                    "Authorization": "Bearer " + token},
-                           timeout=15, retries=2)
+            opener2 = _login_opener(proxy)
+            ui_url = validate_public_http_url(cfg["openapi"] + PATH_USERINFO,
+                                              resolve=opener2 is None)
+            req_ui = urllib.request.Request(
+                ui_url, method="GET",
+                headers={"Accept": "application/json",
+                         "User-Agent": CLIENT_UA,
+                         "Authorization": "Bearer " + token})
+            with qoder_net.open_url(opener2, req_ui, timeout=15) as resp_ui:
+                ui = json.loads(resp_ui.read().decode("utf-8"))
             uid = str(ui.get("id") or "")
             nickname = str(ui.get("name") or "")
             user_type = str(ui.get("user_type") or "") or DEFAULT_USER_TYPE
@@ -1691,9 +1865,67 @@ class AccountPool(object):
             "userType": user_type,
             "organizationId": org_id,
             "organizationName": org_name,
+            "proxy": proxy,
         })
         self.add(account)
         return account
+
+
+def _login_opener(proxy):
+    """登录/导入阶段的代理 opener（无账号对象可挂熔断计数）。
+
+    返回 None 表示直连；代理非法则抛 ValueError 给调用方（看板报错）。
+    """
+    pcfg = qoder_net.parse_proxy_url(proxy)
+    return qoder_net.build_opener(pcfg) if pcfg is not None else None
+
+
+def proxy_selftest(proxy, account=None, realm=None):
+    """代理端到端自检（看板「测试代理」按钮）。
+
+    分两段，逐段给结论，便于定位是代理问题还是账号问题：
+      1) 隧道 + 出口 IP：经代理访问 ipify，回显第三方看到的出口 IP
+         （只暴露代理 IP，不涉及宿主机真实 IP）；
+      2) 官方端到端：给定账号时，用其 token 经代理打官方 userinfo。
+
+    返回 {ok, exit_ip, latency_ms, official_ok, official_status/message, error}。
+    非法代理串抛 ValueError；隧道失败返回 ok=False + 明确原因（不抛）。
+    """
+    out = {"ok": False, "exit_ip": "", "latency_ms": None,
+           "official_ok": None, "official_message": "", "error": ""}
+    pcfg = qoder_net.parse_proxy_url(proxy)   # 非法 -> ValueError 上抛
+    if pcfg is None:
+        out["error"] = "代理为空"
+        return out
+    try:
+        ip, latency = qoder_net.fetch_exit_ip(pcfg)
+        out["exit_ip"] = ip
+        out["latency_ms"] = latency
+        out["ok"] = True
+    except Exception as exc:
+        out["error"] = "隧道/出口检测失败：%s" % qoder_net.error_text(exc)
+        return out
+
+    if account is None:
+        return out
+
+    # 官方端到端：走同一代理打 userinfo（不带熔断副作用，用独立 opener）
+    try:
+        cfg = get_realm_config(realm or account.realm)
+        url = validate_public_http_url(cfg["openapi"] + PATH_USERINFO,
+                                       resolve=False)
+        headers = dict(account.headers())
+        req = urllib.request.Request(url, method="GET", headers=headers)
+        with qoder_net.open_url(qoder_net.build_opener(pcfg), req,
+                                timeout=20) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        out["official_ok"] = True
+        out["official_message"] = "官方 userinfo 正常（%s）" % (
+            str(data.get("name") or data.get("id") or "ok")[:32])
+    except Exception as exc:
+        out["official_ok"] = False
+        out["official_message"] = "官方接口经代理失败：%s" % qoder_net.error_text(exc)
+    return out
 
 
 def _make_pkce():
@@ -1868,8 +2100,14 @@ def scan_desktop_credentials():
     return found
 
 
-def import_desktop_credential(path=None, realm=None):
-    """把扫描到的凭证导入账号池。path=None 时导入扫描到的全部有效项。"""
+def import_desktop_credential(path=None, realm=None, proxy=""):
+    """把扫描到的凭证导入账号池。path=None 时导入扫描到的全部有效项。
+
+    proxy：账号级 IP 代理（单行 URL）；导入的账号从入池起就走该出口。
+    """
+    proxy = str(proxy or "").strip()
+    if proxy:
+        qoder_net.parse_proxy_url(proxy)
     if not path:
         imported, errors = [], []
         for item in scan_desktop_credentials():
@@ -1877,7 +2115,7 @@ def import_desktop_credential(path=None, realm=None):
                 continue
             try:
                 imported.append(import_desktop_credential(
-                    path=item["path"], realm=item["realm"]))
+                    path=item["path"], realm=item["realm"], proxy=proxy))
             except Exception as exc:
                 errors.append("%s/%s: %s" % (item["realm"], item["file"], exc))
         if errors:
@@ -1945,6 +2183,7 @@ def import_desktop_credential(path=None, realm=None):
         "expiresAt": exp or (int(time.time()) + 30 * 86400),
         "source": "desktop-app",
         "enabled": True,
+        "proxy": proxy,
     })
     return add_to_pool(account)
 
@@ -1980,6 +2219,8 @@ def build_export_document(accounts, realm=None, include_secrets=True, uids=None)
             row.pop("accessToken", None)
             row.pop("refreshToken", None)
             row.pop("personalToken", None)
+            # 代理串可能含代理账号密码：与凭证同级，脱敏导出必须剥离
+            row.pop("proxy", None)
         rows.append(row)
     return {
         "format": EXPORT_FORMAT,
@@ -2045,6 +2286,10 @@ def normalise_import_row(row, realm=None):
     exp = normalize_epoch(pick("expiresAt"))
     if not exp:
         exp = int(time.time()) + 3600
+    proxy = str(pick("proxy") or "").strip()
+    if proxy:
+        # 非法代理串按坏行处理（dry-run 时会明确报出），绝不静默直连
+        qoder_net.parse_proxy_url(proxy)
     return {
         "uid": uid,
         "nickname": str(pick("nickname") or ""),
@@ -2062,4 +2307,6 @@ def normalise_import_row(row, realm=None):
         "organizationName": str(pick("organizationName") or ""),
         "lastError": "",
         "cooldownUntil": 0.0,
+        # 导入行可自带代理（导出文件含 proxy 时会带过来）；格式非法即为坏行
+        "proxy": proxy,
     }

@@ -650,6 +650,21 @@ a:hover{text-decoration:underline}
           </label>
         </div>
       </div>
+      <div style="margin-bottom:16px">
+        <div style="font-size:12px;color:var(--dim);margin-bottom:6px;font-weight:600">IP 代理（可选，防泄漏推荐填写）</div>
+        <input id="loginProxy" type="text" autocomplete="off" spellcheck="false"
+               placeholder="socks5h://user:pass@1.2.3.4:1080（留空 = 直连）"
+               style="width:100%;background:var(--panel2);border:1px solid var(--line);
+                      border-radius:8px;padding:9px 12px;color:var(--fg);font:inherit">
+        <div class="hint" style="margin-top:6px;font-size:11px">
+          支持 http / https / socks5 / socks5h（<code>socks5h</code> 域名交代理远端解析，防本机 DNS 泄漏）。
+          填了代理后该账号的网关侧流量全部走代理，隧道失败会熔断暂停、<b>绝不回退直连</b>。
+        </div>
+        <div style="background:var(--warn-soft);border:1px solid var(--warn);border-radius:8px;padding:9px 12px;margin-top:8px;font-size:11.5px;color:var(--warn)">
+          ⚠️ <b>浏览器授权这一步走的是你本机的真实 IP</b>（网关管不到浏览器）。严格防泄漏场景请改用
+          <b>「🔑 导入 PAT」</b>（PAT 交换全程走网关、可代理）；若坚持用 OAuth，请在浏览器里挂同一代理/VPN 完成授权。
+        </div>
+      </div>
       <div class="step" id="step1"><div class="n">1</div><div class="t" id="step1Text">正在申请授权登录链接…</div></div>
       <div class="step" id="step2"><div class="n">2</div><div class="t">在浏览器里打开下方链接并完成登录授权</div></div>
       <div id="loginLinkBox"></div>
@@ -674,6 +689,16 @@ a:hover{text-decoration:underline}
         只读检测本机桌面 App 与命令行客户端里已登录的凭证（国际版 / 国内版），
         点击「导入」才会加入网关。导入后可删除原客户端或继续共用。
       </p>
+      <div style="background:var(--warn-soft);border:1px solid var(--warn);border-radius:8px;padding:9px 12px;margin:0 0 12px;font-size:11.5px;color:var(--warn)">
+        ⚠️ 这些凭证是官方客户端用<b>本机真实 IP</b>登录产生的；导入后网关侧流量可走代理，
+        但登录时的 IP 已由官方记录。严格防泄漏场景建议用「🔑 导入 PAT」重新建号。
+      </div>
+      <div style="margin-bottom:10px">
+        <input id="scanProxy" type="text" autocomplete="off" spellcheck="false"
+               placeholder="导入时套用的 IP 代理（可选）"
+               style="width:100%;background:var(--panel2);border:1px solid var(--line);
+                      border-radius:8px;padding:9px 12px;color:var(--fg);font:inherit">
+      </div>
       <div id="desktopScanBody"><p class="hint">正在检测…</p></div>
     </div>
     <div class="modal-ft">
@@ -709,6 +734,14 @@ a:hover{text-decoration:underline}
             <span><b>国际版</b> (qoder.com)</span>
           </label>
         </div>
+        <input id="patProxy" type="text" autocomplete="off" spellcheck="false"
+               placeholder="IP 代理（可选）：socks5h://user:pass@1.2.3.4:1080"
+               style="width:100%;background:var(--panel2);border:1px solid var(--line);
+                      border-radius:8px;padding:9px 12px;color:var(--fg);font:inherit">
+        <div class="hint" style="font-size:11px">
+          ✅ 严格防泄漏推荐走 PAT：交换 jobToken 与拉取身份全程在网关侧、可直接走代理，
+          没有浏览器授权那一步的真实 IP 暴露。
+        </div>
         <div id="patBody" style="min-height:20px"></div>
       </div>
     </div>
@@ -740,6 +773,38 @@ a:hover{text-decoration:underline}
       <span style="flex:1"></span>
       <button class="sec" onclick="closeImport()">取消</button>
       <button id="btnImportCommit" class="primary" onclick="commitImport(this)" disabled>确认导入</button>
+    </div>
+  </div>
+</div>
+
+<div class="modal-mask" id="proxyModal">
+  <div class="modal" role="dialog" aria-modal="true" style="width:min(600px,100%)">
+    <div class="modal-hd">
+      <h2>账号 IP 代理</h2>
+      <button class="modal-x" onclick="closeProxyModal()" aria-label="关闭">×</button>
+    </div>
+    <div class="modal-bd">
+      <p class="hint" style="margin-top:0">
+        为 <b id="proxyModalWho">该账号</b> 配置出口代理。配置后该账号的网关侧全部流量
+        （推理 / 刷新 / 签到 / 额度 / 活动）都走代理，宿主机真实 IP 对上游不可见；
+        代理连续失败会自动熔断暂停该账号，<b>绝不回退直连</b>。
+      </p>
+      <input id="proxyModalInput" type="text" autocomplete="off" spellcheck="false"
+             placeholder="socks5h://user:pass@1.2.3.4:1080（留空 = 直连）"
+             style="width:100%;background:var(--panel2);border:1px solid var(--line);
+                    border-radius:8px;padding:9px 12px;color:var(--fg);font:inherit">
+      <div class="hint" style="margin-top:6px;font-size:11px">
+        支持 http / https / socks5 / socks5h，鉴权写在 URL 里（<code>user:pass@host:port</code>）。
+        <code>socks5h</code> 由代理远端解析域名，最防泄漏。
+      </div>
+      <div id="proxyModalResult" style="min-height:18px;margin-top:10px"></div>
+    </div>
+    <div class="modal-ft">
+      <button class="sec" onclick="testProxyFromModal(this)">测试连通</button>
+      <button class="sec" onclick="clearProxy(this)">清除代理</button>
+      <span style="flex:1"></span>
+      <button class="sec" onclick="closeProxyModal()">取消</button>
+      <button class="primary" onclick="saveProxy(this)">保存</button>
     </div>
   </div>
 </div>
@@ -801,7 +866,9 @@ async function triggerLoginForSelectedRealm(){
   if(s1Text) s1Text.textContent = isCn ? "正在向 qoder.com.cn (国内版) 申请设备授权..." : "正在向 qoder.com (国际版) 申请设备授权...";
 
   try{
-    const r = await postJSON("/accounts/login/start", {platform: "CLI", realm: realm});
+    const proxyEl = document.getElementById("loginProxy");
+    const proxy = proxyEl ? proxyEl.value.trim() : "";
+    const r = await postJSON("/accounts/login/start", {platform: "CLI", realm: realm, proxy: proxy});
     loginState = r.state;
     if(s1) s1.className = "step done";
     if(s2) s2.className = "step active";
@@ -1611,6 +1678,19 @@ function accountRow(a){
               : a.expiresIn === 'expired' ? '<span class="badge bad">已过期</span>'
               : '<span class="badge ok">可用</span>';
   const err = a.lastError ? '<div class="hint" style="color:var(--warn);margin:2px 0 0">' + esc(a.lastError) + '</div>' : '';
+  // 代理徽章：已配置显示脱敏串；熔断/非法给红黄提示；未配置不显示。
+  const p = a.proxy || {};
+  let proxyBadge = '';
+  if(p.set){
+    if(p.invalid){
+      proxyBadge = '<div class="mono" style="font-size:10px;margin-top:2px;color:var(--bad)" title="代理配置非法">代理: 配置非法</div>';
+    } else if(p.paused){
+      proxyBadge = '<div class="mono" style="font-size:10px;margin-top:2px;color:var(--bad)" title="代理连续失败已熔断暂停">代理: ' + esc(p.masked) + ' · 已熔断</div>';
+    } else {
+      const failNote = p.failures ? (' · 失败 ' + p.failures + ' 次') : '';
+      proxyBadge = '<div class="mono" style="font-size:10px;margin-top:2px;color:var(--accent)" title="该账号全部流量经此代理出口">代理: ' + esc(p.masked) + failNote + '</div>';
+    }
+  }
   const cred = a.credits;
   const credText = cred ? ('<b style="color:var(--accent2)">' + fmt(cred.remain) + '</b> / ' + fmt(cred.size)) : '<span style="color:var(--dim)">未查询</span>';
   return '<tr>'
@@ -1619,6 +1699,7 @@ function accountRow(a){
     +   '<div style="font-weight:600;font-size:13px;color:var(--fg)">' + esc(a.nickname) + '</div>'
     + '<div class="mono" style="color:var(--dim);font-size:11px">' + esc(a.uid.slice(0,8)) + ' · ' + esc(a.source) + ' · 到期 ' + esc(a.expiresIn || '?') + '</div>'
     + (a.machineId ? ('<div class="mono" style="color:var(--dim);font-size:10px;margin-top:2px" title="由账号UID稳定派生的专属设备码，防多号关联风控">设备码: ' + esc(a.machineId.slice(0,14)) + '...</div>') : '')
+    + proxyBadge
     + err + '</td>'
     + '<td style="text-align:center">' + state + '</td>'
     + '<td style="text-align:left;white-space:nowrap">' + credText + '</td>'
@@ -1633,6 +1714,7 @@ function accountRow(a){
     +     '<button class="sec mini" onclick="refreshOne(&quot;' + uidAttr + '&quot;, this)">刷新</button>'
     +   '</div>'
     +   '<div style="display:flex;gap:4px;justify-content:center">'
+    +     '<button class="sec mini" onclick="openProxyModal(&quot;' + uidAttr + '&quot;)">代理</button>'
     +     '<button class="sec mini" onclick="exportOne(&quot;' + uidAttr + '&quot;)">导出</button>'
     +     '<button class="danger mini" onclick="deleteAccount(&quot;' + uidAttr + '&quot;,&quot;' + nameAttr + '&quot;, this)">删除</button>'
     +   '</div>'
@@ -1710,6 +1792,107 @@ async function fetchCredits(btn){
   }
 }
 const queryCredits = fetchCredits;
+
+/* ---------------------------- 账号 IP 代理 ---------------------------- */
+let PROXY_MODAL_UID = null;
+
+function openProxyModal(uid){
+  PROXY_MODAL_UID = uid;
+  const a = (window.ACCOUNTS || []).find(x => x.uid === uid) || {};
+  const who = document.getElementById('proxyModalWho');
+  const input = document.getElementById('proxyModalInput');
+  const result = document.getElementById('proxyModalResult');
+  if(who) who.textContent = (a.nickname || uid.slice(0,8)) + '（' + (a.realm === 'cn' ? '国内版' : '国际版') + '）';
+  if(input){
+    input.value = '';
+    input.placeholder = (a.proxy && a.proxy.masked)
+      ? ('当前: ' + a.proxy.masked + '（留空并保存 = 不改；点「清除代理」= 直连）')
+      : 'socks5h://user:pass@1.2.3.4:1080（留空 = 直连）';
+  }
+  if(result) result.innerHTML = '';
+  const m = document.getElementById('proxyModal');
+  if(m) m.classList.add('show');
+}
+
+function closeProxyModal(){
+  const m = document.getElementById('proxyModal');
+  if(m) m.classList.remove('show');
+  PROXY_MODAL_UID = null;
+}
+
+function proxyModalValue(){
+  const input = document.getElementById('proxyModalInput');
+  return input ? input.value.trim() : '';
+}
+
+function renderProxyResult(r){
+  const box = document.getElementById('proxyModalResult');
+  if(!box) return;
+  if(!r){ box.innerHTML = ''; return; }
+  let html = '';
+  if(r.error){
+    html += '<p class="hint" style="color:var(--bad)">✗ ' + esc(r.error) + '</p>';
+  } else {
+    html += '<p class="hint" style="color:#26bb82">✓ 隧道连通，出口 IP: <b class="mono">'
+         + esc(r.exit_ip || '?') + '</b>'
+         + (r.latency_ms != null ? '（' + r.latency_ms + 'ms）' : '') + '</p>';
+    if(r.official_ok === true){
+      html += '<p class="hint" style="color:#26bb82;font-size:11px">✓ ' + esc(r.official_message || '官方接口正常') + '</p>';
+    } else if(r.official_ok === false){
+      html += '<p class="hint" style="color:var(--warn);font-size:11px">⚠ ' + esc(r.official_message || '官方接口经代理失败') + '</p>';
+    }
+  }
+  box.innerHTML = html;
+}
+
+async function testProxyFromModal(btn){
+  if(btn){ btn.disabled = true; btn.textContent = '测试中...'; }
+  const box = document.getElementById('proxyModalResult');
+  if(box) box.innerHTML = '<p class="hint">正在经代理请求 ipify / 官方接口…（首包可能较慢）</p>';
+  try{
+    const proxy = proxyModalValue();
+    const payload = {uid: PROXY_MODAL_UID};
+    if(proxy) payload.proxy = proxy;   // 留空则测账号当前配置
+    const r = await postJSON('/accounts/proxy-test', payload);
+    renderProxyResult(r);
+  }catch(e){
+    if(box) box.innerHTML = '<p class="hint" style="color:var(--bad)">✗ ' + esc(e.message) + '</p>';
+  }finally{
+    if(btn){ btn.disabled = false; btn.textContent = '测试连通'; }
+  }
+}
+
+async function saveProxy(btn){
+  if(btn){ btn.disabled = true; btn.textContent = '保存中...'; }
+  const box = document.getElementById('proxyModalResult');
+  try{
+    const proxy = proxyModalValue();
+    await postJSON('/accounts/proxy', {uid: PROXY_MODAL_UID, proxy: proxy});
+    await loadAccounts();
+    toast(proxy ? '代理已保存，该账号流量将走此出口' : '已清除代理（该账号恢复直连）', 'ok');
+    closeProxyModal();
+  }catch(e){
+    if(box) box.innerHTML = '<p class="hint" style="color:var(--bad)">✗ ' + esc(e.message) + '</p>';
+  }finally{
+    if(btn){ btn.disabled = false; btn.textContent = '保存'; }
+  }
+}
+
+async function clearProxy(btn){
+  if(!confirm('清除该账号的代理配置？清除后该账号将直连上游（宿主机真实 IP 会暴露）。')) return;
+  if(btn) btn.disabled = true;
+  const box = document.getElementById('proxyModalResult');
+  try{
+    await postJSON('/accounts/proxy', {uid: PROXY_MODAL_UID, proxy: ''});
+    await loadAccounts();
+    toast('已清除代理，该账号恢复直连', 'warn');
+    closeProxyModal();
+  }catch(e){
+    if(box) box.innerHTML = '<p class="hint" style="color:var(--bad)">✗ ' + esc(e.message) + '</p>';
+  }finally{
+    if(btn) btn.disabled = false;
+  }
+}
 
 async function toggleAccount(uid, enable, btn){
   if(btn) btn.disabled = true;
@@ -2074,8 +2257,10 @@ function renderDesktopScan(list){
 async function doImportDesktop(btn, path, realm){
   btn.disabled = true;
   btn.textContent = '导入中...';
+  const proxyEl = document.getElementById('scanProxy');
+  const proxy = proxyEl ? proxyEl.value.trim() : "";
   try{
-    const r = await postJSON('/accounts/import/desktop', {path: path, realm: realm});
+    const r = await postJSON('/accounts/import/desktop', {path: path, realm: realm, proxy: proxy});
     const a = (r.imported || [])[0] || {};
     toast('已导入 ' + (a.nickname || (a.uid||'').slice(0,8)) + ' 到 ' + (a.realm === 'cn' ? '国内版' : '国际版'));
     if(a.uid && window.SCAN_POOL) window.SCAN_POOL.add(a.uid);
@@ -2104,6 +2289,8 @@ function openPatImport(){
   if(body) body.innerHTML = '';
   const input = document.getElementById('patInput');
   if(input) input.value = '';
+  const proxyInput = document.getElementById('patProxy');
+  if(proxyInput) proxyInput.value = '';
   const rCn = document.getElementById('patRadioCn');
   const rIntl = document.getElementById('patRadioIntl');
   if(rCn) rCn.checked = (window.VIEW_REALM !== 'intl');
@@ -2125,10 +2312,12 @@ async function doImportPat(btn){
     return;
   }
   const realm = (document.getElementById('patRadioIntl') && document.getElementById('patRadioIntl').checked) ? 'intl' : 'cn';
+  const proxyEl = document.getElementById('patProxy');
+  const proxy = proxyEl ? proxyEl.value.trim() : "";
   if(btn){ btn.disabled = true; btn.textContent = '导入中...'; }
   if(body) body.innerHTML = '<p class="hint">正在交换 jobToken 并拉取账号身份…</p>';
   try{
-    const r = await postJSON('/accounts/import/pat', {pat: pat, realm: realm});
+    const r = await postJSON('/accounts/import/pat', {pat: pat, realm: realm, proxy: proxy});
     const a = (r.imported || [])[0] || {};
     if(body) body.innerHTML = '<p class="hint" style="color:#26bb82">✓ 已导入 ' + esc(a.nickname || (a.uid||'').slice(0,8)) + ' 到 ' + (realm === 'cn' ? '国内版' : '国际版') + '</p>';
     toast('已导入 ' + (a.nickname || (a.uid||'').slice(0,8)) + ' 到 ' + (realm === 'cn' ? '国内版' : '国际版'));

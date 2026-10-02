@@ -17,6 +17,7 @@
 - **双区域独立路由**：支持 🌐 国际版 (qoder.com / api1.qoder.sh，备用 api2/api3 自动故障切换) 与 🇨🇳 国内版 (qoder.com.cn / gateway.qoder.com.cn) 独立配置与管理，区域独占模型（如国内 `q37fmodel`/`glm-5.2`、国际 `smodel`/`ultimate`）自动路由到归属出口并拦截错配 Key，看板一键切换且状态落盘持久化。
 - **COSY 签名推理链路**：RSA 包裹 AES 会话密钥 + MD5 请求签名 + 自定义 Base64 请求体编码，纯标准库实现（含 AES-128/256、RSA-PKCS1v15、GCM、DPAPI、QMC 纯 Python 实现，Docker alpine 下同样零依赖），逆向对齐官方桌面/CLI 客户端协议。
 - **稳定物理设备指纹隔离 (`derive_id`)**：以账号自身 UID 稳定哈希派生专属 `cosy-machineid` / `cosy-machinetoken` / 会话标识，同一账号长期固定在同一台虚拟物理设备，天然防多号关联风控。
+- **账号级 IP 代理（出站防泄漏）**：可为每个账号单独配置 `http/https/socks5/socks5h`（带鉴权）出口代理，账号的推理/刷新/签到/额度/登录全程走该出口；隧道失败**熔断暂停、绝不回退直连**，宿主机真实 IP 不外泄。
 - **OAuth 设备授权一键免客户端登录**：PKCE (S256) 设备流（双区 URL 参数按官方差异构造：国内带 `redirect_uri+client_id+machine_id`，国际带 `client_id+machine_id`），点击看板链接在浏览器完成授权即可自动入池；亦支持 PAT (`pt-`) 导入，jobToken 自动交换与轮换。
 - **每日签到与额度体系（双区域 · 真实领取）**：「每日领取 100 Credits」等活动**由网关直接领取**——用桌面端请求头（`Cosy-ClientType: 10` + 机器头，缺了服务端会返回空列表）列出活动 → 对 `CLAIMABLE` 的 Credits 活动 `POST /sash/api/v1/me/campaigns/{id}/claim`（官方幂等：已领返回 `replayed`，不会重复发放）；旧 sash 签到接口仅在仍开放时兜底（能力运行时探测，404 记「本区域无此接口」6 小时后自动重探）；Pro 升级包资格检查与领取、quota/usage 额度与套餐快照实时刷新。
 - **后台常驻定时调度器**：每日整点排程（09:00 / 21:00 签到 · 22:00 Token 集中保活），`drt-` / `jrt-` 按前缀路由刷新，PAT 最终兜底。
@@ -250,6 +251,22 @@ personalToken: pt- (长期兜底, 看板导入)
 
 刷新按 `refreshToken` 前缀路由，PAT 永不覆盖活跃 OAuth 会话，只做最终兜底；`access token` 轮换后 COSY 会话自动重建。
 
+### 6. 账号级 IP 代理（出站防泄漏，fail-closed）
+
+给**单个账号**配置独立的出站代理，让不同账号从不同出口 IP 访问官方，宿主机真实 IP 对上游不可见。纯标准库实现（`qoder_net.py`，手写 CONNECT / SOCKS5 握手），alpine 下零依赖可直接跑。
+
+- **协议与填法**：单行 URL，鉴权写在 userinfo 里——`scheme://user:pass@host:port`
+  - `http://` / `https://`：经 HTTP(S) 代理 CONNECT 建隧道（`https://` 会先与代理本身 TLS）；
+  - `socks5://`：域名**本地解析**后发 IP（标准 socks5 语义）；
+  - `socks5h://`：域名交代理**远端解析**（防本机 DNS 泄漏，推荐）。
+- **全流程覆盖**：配了代理的账号，其**网关侧一切流量**都走该出口——推理（含流式 SSE）、动态模型清单、token 刷新、userinfo/quota/plan、签到/活动/claim、以及添加账号时的 device 轮询与 PAT 交换。目标 TLS 在隧道之上照常做端到端证书校验，与直连完全一致。
+- **绝不回退直连（fail-closed）**：隧道建立失败（连不上/鉴权错/被拒/超时）一律让该请求失败并**换号**，不存在"代理失败改直连"的代码路径；走代理时还会**跳过本地 DNS 解析**（域名由代理解析），避免解析器侧泄漏。
+- **熔断暂停**：同一账号连续 5 次代理失败自动**暂停该账号**（看板标红「已熔断」），避免后台调度器反复空打死代理；看板重新启用或改配置即清零恢复。
+- **原生桥跳过**：活动平台默认用官方 `runtime-info.exe` 取机器身份，而该二进制会用**宿主机真实 IP 直连**官方、网关管不到——因此**配了代理的账号自动跳过原生桥**，改用 UID 派生身份（常规签到不受影响；仅"设备定向"活动可能不再出现）。
+- **看板操作**：三个添加入口（OAuth / PAT / 本机凭证扫描）都可选填代理；账号行有「代理」按钮可改配置 / 清空 / **一键测试**（隧道握手 + ipify 出口 IP 回显 + 官方 userinfo 端到端，返回出口 IP、延迟与官方连通性）。
+- **凭据保护**：代理串（可能含代理账号密码）与 token 同级处理——日志/看板/错误信息一律**脱敏**为 `socks5h://us***@1.2.3.4:1080`；账号导出仅在 `?secrets=1` 全量导出中携带，脱敏导出自动剥离。
+- **⚠️ 残余风险**：OAuth 授权在你的**浏览器**里完成，浏览器访问官方授权页用的是宿主机真实 IP，网关无法代理。严格防泄漏场景请改用**「🔑 导入 PAT」**（交换全程在网关侧、可代理）；本机凭证扫描导入的账号，其 token 本就是官方客户端用本机 IP 登录产生的，同理。
+
 ---
 
 ## 三、账号添加与管理
@@ -317,17 +334,20 @@ custom freeform 工具（`apply_patch`）自动降级为 function 工具出站�
 | POST | /accounts/login/start | 发起 OAuth 设备授权 |
 | POST | /accounts/import/pat | 导入 PAT 令牌 |
 | POST | /accounts/checkin | 手动签到（单个/全部） |
+| POST | /accounts/proxy | 设置/清空某账号的 IP 代理（空串 = 直连） |
+| POST | /accounts/proxy-test | 代理端到端自检（隧道 + 出口 IP + 官方 userinfo） |
 
 ---
 
 ## 六、开发与测试
 
 ```bash
-# 离线确定性测试（342 项断言：AES-128/256 向量与官方 fixture KAT、QMC/凭证解密、
+# 离线确定性测试（AES-128/256 向量与官方 fixture KAT、QMC/凭证解密、
 # 自定义 B64、COSY 签名、双区官方目录全字段（峰谷价/多窗口/思考档位/展示 id/解析）、
 # 独占路由、签到能力运行时探测与 DISABLED 归一化、活动平台归一化、DeepSeek
 # reasoning_content 回填与 flatten 保留、请求体、信封解包、custom 工具转译、
-# 本机凭证扫描）
+# 本机凭证扫描、账号级 IP 代理（URL 解析/脱敏/CONNECT+SOCKS5 握手字节序/
+# 零直连出口/fail-closed/熔断/导入导出携带））
 python _test_qoder.py
 
 # 直接启动
@@ -360,6 +380,7 @@ python _verify_models.py --base http://127.0.0.1:8790
 | `qoder_tasks.py` | 签到闭环（含 DISABLED 归一化）、Pro 福利包、批量执行、保活巡检 |
 | `qoder_scheduler.py` | 整点排程调度器（09/21 签到 · 22:00 保活，签到能力运行时探测） |
 | `qoder_settings.py` | 面板密码 (PBKDF2)、多 API Key 出口绑定、会话管理 |
+| `qoder_net.py` | 账号级 IP 代理：代理 URL 解析/脱敏 + 纯标准库 HTTP CONNECT / SOCKS5 隧道 + 零直连出口的 urllib opener |
 | `qoder_fingerprint.py` | UID 稳定设备指纹派生 (derive_id) |
 | `baseprompt.json` | 官方推理请求体模板 |
 | `dashboard.html` | 单文件 Web 看板（本地凭证两步扫描导入 + PAT 导入 + 签到中心的**本机虚拟化检测**卡片） |

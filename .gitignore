@@ -16,6 +16,9 @@ __pycache__/
 _shots/
 *.log
 _tmp_*
+# _test_qoder.py 的隔离账号/用量目录（避免测试产物被误提交）
+_acc/
+_use/
 .DS_Store
 Thumbs.db
 

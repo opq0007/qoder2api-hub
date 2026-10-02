@@ -45,6 +45,7 @@ import uuid
 
 import qoder_accounts
 import qoder_catalog
+import qoder_net
 import qoder_settings
 import qoder_sign
 from qoder_sign import qoder_encode, SESSIONS
@@ -78,13 +79,17 @@ def _host_boundary_violation(ip, allow_local):
     return False
 
 
-def validate_public_http_url(url, allow_local=False):
+def validate_public_http_url(url, allow_local=False, resolve=True):
     """SSRF 防护：仅允许 http/https，且 host 不得指向本机/私有/保留网段。
 
     与 qoder_accounts.validate_public_http_url 同逻辑、独立实现防同错：
     本文件的 urlopen 调用点必须经过本文件的边界校验（签名链路上的 URL
     在 sess.headers() 之后再校验一次，确保进入 Request 的字符串是洁净的）。
     allow_local 仅供显式面向本机网关的开发/验证脚本使用。
+
+    resolve=False：跳过本地 DNS 解析校验（仅名称级）。账号走代理时必须传
+    False——本机 getaddrinfo 会向本机解析器暴露目标域名，破坏防泄漏语义；
+    域名交给代理远端解析。
     """
     parsed = urllib.parse.urlsplit(str(url or ""))
     if parsed.scheme not in ("http", "https"):
@@ -104,6 +109,8 @@ def validate_public_http_url(url, allow_local=False):
         if _host_boundary_violation(literal, allow_local):
             raise ValueError(
                 "requests to private/reserved address %s are not allowed" % literal)
+        return url
+    if not resolve:
         return url
     port = parsed.port or (443 if parsed.scheme == "https" else 80)
     try:
@@ -1414,6 +1421,12 @@ def read_dynamic_models(realm=None):
     # 签名以 qoder_encode("{}") 作为 body 参与 MD5；请求同样携带该 body。
     sign_body = qoder_encode(b"{}")
     payload = None
+    try:
+        opener = account.net_opener()
+    except qoder_net.ProxyTunnelError as exc:
+        log("model discovery skipped: account %s proxy unavailable: %s"
+            % (account.uid[:8], exc), level="WARN")
+        return []
     for host in gateway_candidates(r):
         raw_url = host + MODELS_PATH
         try:
@@ -1421,13 +1434,19 @@ def read_dynamic_models(realm=None):
             headers = sess.headers(sign_body, raw_url, model_key="", sse=False,
                                    accept="application/json")
             headers["User-Agent"] = CLIENT_UA
-            url = validate_public_http_url(raw_url)
+            url = validate_public_http_url(raw_url, resolve=opener is None)
             req = urllib.request.Request(url, data=sign_body.encode("utf-8"),
                                          method="GET", headers=headers)
-            with urllib.request.urlopen(req, timeout=15) as resp:
+            with qoder_net.open_url(opener, req, timeout=15) as resp:
                 payload = json.loads(resp.read().decode("utf-8"))
+            if opener is not None:
+                account.note_proxy_success()
             break
         except Exception as exc:
+            if qoder_net.is_proxy_error(exc):
+                # 换域名无意义（同一个死代理），直接放弃动态源走静态兜底
+                log("model discovery via proxy failed: %s" % exc, level="WARN")
+                break
             log("model discovery failed on %s: %s" % (host, exc))
     if payload is None:
         return []
@@ -2769,17 +2788,31 @@ def open_upstream(payload, session_key=None, target_realm=None):
         resp = None
         last_exc = None
         detail = ""
+        # 账号级代理：配了代理的账号整条推理链路走隧道（fail-closed）；
+        # 熔断暂停时 net_opener() 直接抛 ProxyPausedError，换号而非直连。
+        try:
+            opener = account.net_opener()
+        except qoder_net.ProxyTunnelError as exc:
+            last_exc = exc
+            if session_key and POOL:
+                POOL.affinity.unbind(session_key)
+            log("account %s proxy unavailable: %s - rotating"
+                % (account.uid[:8], exc), level="WARN", tag="chat")
+            continue
         for tries in range(TRANSIENT_MAX_RETRIES + 1):
             try:
                 sess = SESSIONS.get(account)
                 headers = sess.headers(encoded, raw_url, model_key=model_key,
                                        sse=True)
                 headers["User-Agent"] = CLIENT_UA
-                chat_url = validate_public_http_url(raw_url)
+                chat_url = validate_public_http_url(raw_url,
+                                                    resolve=opener is None)
                 req = urllib.request.Request(chat_url,
                                              data=encoded.encode("utf-8"),
                                              method="POST", headers=headers)
-                resp = urllib.request.urlopen(req, timeout=600)
+                resp = qoder_net.open_url(opener, req, timeout=600)
+                if opener is not None:
+                    account.note_proxy_success()
                 break
             except urllib.error.HTTPError as exc:
                 try:
@@ -2810,6 +2843,10 @@ def open_upstream(payload, session_key=None, target_realm=None):
             except Exception as exc:
                 last_exc = exc
                 detail = ""
+                # 代理隧道失败是确定性的（连不上代理/鉴权错/被拒）：不重试、
+                # 不换域名（换域名仍走同一个死代理），直接进入分类换号。
+                if qoder_net.is_proxy_error(exc):
+                    break
                 # 传输层瞬时故障（TLS EOF / 连接重置 / 超时）同样原地重试；
                 # 若还有官方备用推理域名，优先换域名（对整域故障更有效）。
                 if _is_transient_transport(exc) \
@@ -2894,7 +2931,16 @@ def open_upstream(payload, session_key=None, target_realm=None):
             if session_key and POOL:
                 POOL.affinity.unbind(session_key)
             if exc is not None:
-                if _is_transient_transport(exc):
+                if qoder_net.is_proxy_error(exc):
+                    # 代理故障：计入账号熔断计数（阈值后自动暂停，绝不直连），
+                    # 但**不**触发上游 60s 错误冷却——那是上游的锅，与代理无关。
+                    text = qoder_net.error_text(exc)
+                    account.note_proxy_failure(text)
+                    log("account %s proxy tunnel failed: %s - rotating "
+                        "(proxy failures: %d)"
+                        % (account.uid[:8], text[:120], account.proxy_failures),
+                        level="WARN", tag="chat")
+                elif _is_transient_transport(exc):
                     # 传输抖动重试耗尽：短冷却换号（不重罚账号）
                     account.note_error("transport transient: %s" % str(exc)[:100],
                                        cooldown=15, single_account=(total <= 1))
@@ -4762,11 +4808,16 @@ class Handler(BaseHTTPRequestHandler):
                 target_realm = "cn"
             try:
                 started = POOL.start_login(realm=target_realm,
-                                           platform=platform)
+                                           platform=platform,
+                                           proxy=payload.get("proxy") or "")
+            except ValueError as exc:
+                return self._error(400, "代理配置非法: %s" % exc,
+                                   "invalid_request_error")
             except Exception as exc:
                 return self._error(502, "could not start login: %s" % exc)
-            log("oauth device login started (realm=%s, state=%s)"
-                % (target_realm, started["state"][:8]))
+            log("oauth device login started (realm=%s, state=%s, proxy=%s)"
+                % (target_realm, started["state"][:8],
+                   qoder_net.mask_proxy(payload.get("proxy") or "") or "direct"))
             return self._json(200, started)
         if path == "/accounts/login/cancel":
             state = payload.get("state") or ""
@@ -4777,26 +4828,34 @@ class Handler(BaseHTTPRequestHandler):
             if realm not in ("intl", "cn"):
                 realm = "cn"
             try:
-                account = POOL.import_pat(pat, realm=realm)
+                account = POOL.import_pat(pat, realm=realm,
+                                          proxy=payload.get("proxy") or "")
+            except ValueError as exc:
+                return self._error(400, "PAT import failed: %s" % exc,
+                                   "invalid_request_error")
             except Exception as exc:
                 return self._error(400, "PAT import failed: %s" % exc)
-            log("imported PAT account %s (realm=%s)"
-                % (account.uid[:8], realm))
+            log("imported PAT account %s (realm=%s, proxy=%s)"
+                % (account.uid[:8], realm,
+                   qoder_net.mask_proxy(account.proxy) or "direct"))
             return self._json(200, {"imported": [account.public()],
                                     "accounts": account_views()})
         if path == "/accounts/import/desktop":
             # 两步确认：{} 只读扫描（双区：桌面 App auth.v1.dat + CLI user）；
             # {"path":...} 按确认导入该凭证；{"all":true} 导入全部有效项。
             target_path = payload.get("path")
+            desktop_proxy = payload.get("proxy") or ""
             if target_path:
                 realm = payload.get("realm")
                 try:
                     account = qoder_accounts.import_desktop_credential(
-                        path=target_path, realm=realm)
+                        path=target_path, realm=realm, proxy=desktop_proxy)
                 except Exception as exc:
                     return self._error(400, "import failed: %s" % exc)
-                log("imported %s (%s) from local client credential"
-                    % (account.uid[:8], account.realm), tag="accounts")
+                log("imported %s (%s) from local client credential (proxy=%s)"
+                    % (account.uid[:8], account.realm,
+                       qoder_net.mask_proxy(account.proxy) or "direct"),
+                    tag="accounts")
                 return self._json(200, {
                     "imported": [account.public()],
                     "accounts": account_views(),
@@ -4804,7 +4863,8 @@ class Handler(BaseHTTPRequestHandler):
                 })
             if payload.get("all"):
                 try:
-                    imported = qoder_accounts.import_desktop_credential()
+                    imported = qoder_accounts.import_desktop_credential(
+                        proxy=desktop_proxy)
                 except Exception as exc:
                     return self._error(400, "import failed: %s" % exc)
                 for account in imported:
@@ -4911,6 +4971,45 @@ class Handler(BaseHTTPRequestHandler):
                                    "enabled" if payload.get("enabled")
                                    else "disabled"))
             return self._json(200, {"account": updated})
+        if path == "/accounts/proxy":
+            # 设置/清空账号级 IP 代理（空串 = 直连）。非法配置返回 400。
+            uid = payload.get("uid")
+            if not uid:
+                return self._error(400, "uid required")
+            try:
+                updated = POOL.set_proxy(uid, payload.get("proxy") or "")
+            except ValueError as exc:
+                return self._error(400, "代理配置非法: %s" % exc,
+                                   "invalid_request_error")
+            if updated is None:
+                return self._error(404, "no such account")
+            log("account %s proxy set to %s" % (uid[:8],
+                                                qoder_net.mask_proxy(
+                                                    payload.get("proxy") or "")
+                                                or "direct"))
+            return self._json(200, {"account": updated,
+                                    "accounts": account_views()})
+        if path == "/accounts/proxy-test":
+            # 代理端到端自检：隧道 + 出口 IP（+ 有账号时官方 userinfo）。
+            # proxy 缺省时用账号现有配置，便于账号卡片直接点测试。
+            uid = payload.get("uid")
+            proxy = payload.get("proxy")
+            account = POOL.get(uid) if uid else None
+            if proxy in (None, ""):
+                if account is None:
+                    return self._error(400, "需要 proxy 或 uid")
+                proxy = account.proxy
+            if not proxy:
+                return self._error(400, "该账号未配置代理")
+            try:
+                result = qoder_accounts.proxy_selftest(
+                    proxy, account=account,
+                    realm=acc_realm(account) if account else None)
+            except ValueError as exc:
+                return self._error(400, "代理配置非法: %s" % exc,
+                                   "invalid_request_error")
+            result["uid"] = account.uid if account else None
+            return self._json(200, result)
         if path == "/accounts/set-all":
             POOL.set_all_enabled(bool(payload.get("enabled")))
             return self._json(200, {"accounts": account_views()})
@@ -5003,6 +5102,10 @@ class Handler(BaseHTTPRequestHandler):
             message = str(exc)
             record_error(model, 502, message,
                          elapsed_ms=int((time.time() - t_start) * 1000))
+            if qoder_net.is_proxy_error(exc):
+                # 代理故障：明确告知（绝不回退直连），看板可见账号熔断状态
+                return self._error(502, "代理不可达：%s"
+                                   % qoder_net.error_text(exc), "proxy_error")
             if message.startswith("no usable account"):
                 return self._error(503, message
                                    + " - add or enable one at the dashboard (/)")
@@ -5203,6 +5306,10 @@ class Handler(BaseHTTPRequestHandler):
             message = str(exc)
             record_error(model, 502, message,
                          elapsed_ms=int((time.time() - t_start) * 1000))
+            if qoder_net.is_proxy_error(exc):
+                # 代理故障：明确告知（绝不回退直连），看板可见账号熔断状态
+                return self._error(502, "代理不可达：%s"
+                                   % qoder_net.error_text(exc), "proxy_error")
             if message.startswith("no usable account"):
                 return self._error(503, message
                                    + " - add or enable one at the dashboard (/)")

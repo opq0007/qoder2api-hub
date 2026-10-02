@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 import sys
+import urllib.error
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 os.environ.setdefault("ACCOUNTS_DIR",
@@ -27,6 +28,7 @@ import qoder_sign as S
 import qoder_catalog as C
 import qoder_accounts as A
 import qoder_tasks as T
+import qoder_net as N
 
 PASS = FAIL = 0
 
@@ -2028,6 +2030,346 @@ check("fetch_tasks_view(realm=intl) 只列国际版账号",
       [a["realm"] for a in _v_intl["accounts"]] == ["intl"], _v_intl["accounts"])
 check("不传 realm 时保持原行为（全部账号）",
       len(_v_all["accounts"]) == 2, _v_all["accounts"])
+
+print()
+print("[30] 账号级 IP 代理：URL 解析 / 脱敏 / 隧道握手 / fail-closed / 熔断")
+
+# --- 30.1 URL 解析 ----------------------------------------------------------
+check("空代理 -> None", N.parse_proxy_url("") is None)
+check("空白代理 -> None", N.parse_proxy_url("   ") is None)
+_p = N.parse_proxy_url("socks5h://alice:s3cr3t@1.2.3.4:1080")
+check("socks5h 解析 scheme", _p.scheme == "socks5h")
+check("socks5h 解析 host/port", (_p.host, _p.port) == ("1.2.3.4", 1080))
+check("socks5h 解析 userinfo", (_p.username, _p.password) == ("alice", "s3cr3t"))
+check("socks5h 远端解析域名", _p.remote_dns is True)
+check("socks5 本地解析域名", N.parse_proxy_url("socks5://a:b@h:1").remote_dns is False)
+_p2 = N.parse_proxy_url("http://user:p%40ss%3Aword@proxy.example.com:8080")
+check("百分号编码的密码被解码", _p2.password == "p@ss:word", _p2.password)
+check("密码可含冒号（只按首个冒号切分）",
+      N.parse_proxy_url("http://u:a:b:c@h:1").password == "a:b:c")
+check("无鉴权代理 username 为 None（不触发空凭据鉴权）",
+      N.parse_proxy_url("socks5://h:1080").username is None)
+check("有鉴权时代理 username 非空",
+      N.parse_proxy_url("socks5://u:p@h:1080").username == "u")
+check("https 代理被支持", N.parse_proxy_url("https://u:p@h:443").scheme == "https")
+for _bad in ("1.2.3.4:1080", "ftp://h:1", "http://h", "http://:1080",
+             "socks5://h:0", "socks5://h:99999", "http://h:notaport"):
+    _raised = False
+    try:
+        N.parse_proxy_url(_bad)
+    except ValueError:
+        _raised = True
+    check("非法代理被拒绝: %r" % _bad, _raised)
+
+# --- 30.2 脱敏（日志/看板绝不出现明文凭据） --------------------------------
+_masked = N.parse_proxy_url("socks5h://alice:s3cr3t@1.2.3.4:1080").mask()
+check("脱敏串不含密码", "s3cr3t" not in _masked, _masked)
+check("脱敏串不含完整用户名", "alice" not in _masked, _masked)
+check("脱敏串保留 scheme/host/port",
+      _masked.startswith("socks5h://") and "1.2.3.4:1080" in _masked, _masked)
+check("mask_proxy 对原始串脱敏", "s3cr3t" not in N.mask_proxy("http://u:s3cr3t@h:8080"))
+check("mask_proxy 空串 -> 空", N.mask_proxy("") == "")
+
+# --- 30.3 is_proxy_error / error_text --------------------------------------
+check("ProxyTunnelError 被识别", N.is_proxy_error(N.ProxyTunnelError("x", "auth")))
+check("ProxyPausedError 被识别", N.is_proxy_error(N.ProxyPausedError("paused")))
+check("URLError 包装的代理错误被识别",
+      N.is_proxy_error(urllib.error.URLError(N.ProxyTunnelError("x"))))
+check("普通错误不被误判", not N.is_proxy_error(ValueError("nope")))
+check("HTTPError 不被误判为代理错误",
+      not N.is_proxy_error(urllib.error.HTTPError("u", 500, "e", {}, None)))
+check("error_text 剥掉 URLError 包装",
+      "boom" in N.error_text(urllib.error.URLError(N.ProxyTunnelError("boom"))))
+
+# --- 30.4 隧道握手（离线：用假 socket 注入脚本） ----------------------------
+class _FakeSock(object):
+    """按脚本吐出 recv 数据、记录 sendall 字节的假 socket。"""
+
+    def __init__(self, script):
+        self._script = list(script)
+        self.sent = b""
+        self.timeout = None
+        self.closed = False
+
+    def sendall(self, data):
+        self.sent += data
+
+    def recv(self, n):
+        if not self._script:
+            return b""
+        chunk = self._script[0]
+        if len(chunk) > n:
+            self._script[0] = chunk[n:]
+            return chunk[:n]
+        self._script.pop(0)
+        return chunk
+
+    def settimeout(self, t):
+        self.timeout = t
+
+    def close(self):
+        self.closed = True
+
+
+def _with_fake_socket(sock, fn):
+    """临时把 socket.create_connection 换成返回假 socket，运行 fn。"""
+    orig = N.socket.create_connection
+    N.socket.create_connection = lambda *a, **k: sock
+    try:
+        return fn()
+    finally:
+        N.socket.create_connection = orig
+
+
+# HTTP CONNECT：带 Basic 鉴权，校验请求行与 Proxy-Authorization
+_sk = _FakeSock([b"HTTP/1.1 200 Connection established\r\n\r\n"])
+_pcfg = N.parse_proxy_url("http://alice:s3cr3t@10.0.0.9:3128")
+_with_fake_socket(_sk, lambda: N.tunnel_socket(_pcfg, "api1.qoder.sh", 443))
+check("HTTP CONNECT 请求行正确",
+      b"CONNECT api1.qoder.sh:443 HTTP/1.1" in _sk.sent, _sk.sent[:120])
+import base64 as _b64
+check("HTTP 代理带 Basic 鉴权",
+      b"Proxy-Authorization: Basic " + _b64.b64encode(b"alice:s3cr3t") in _sk.sent)
+check("CONNECT 后隧道 socket 可用（未关闭）", _sk.closed is False)
+
+# HTTP 407 -> 鉴权失败，明确报错
+_sk407 = _FakeSock([b"HTTP/1.1 407 Proxy Authentication Required\r\n\r\n"])
+try:
+    _with_fake_socket(_sk407, lambda: N.tunnel_socket(_pcfg, "h", 443))
+    _e407 = None
+except N.ProxyTunnelError as _exc:
+    _e407 = _exc
+check("HTTP 407 -> ProxyTunnelError(鉴权)", _e407 is not None and "鉴权" in str(_e407),
+      str(_e407))
+check("HTTP 407 时半成品连接被关闭", _sk407.closed is True)
+
+# SOCKS5 无鉴权 + socks5h：域名以 ATYP=0x03 原样发出（远端解析）
+_sk5 = _FakeSock([b"\x05\x00", b"\x05\x00\x00\x03\x0bexample.com\x00\x50"])
+_p5 = N.parse_proxy_url("socks5h://10.0.0.9:1080")
+_with_fake_socket(_sk5, lambda: N.tunnel_socket(_p5, "example.com", 80))
+check("SOCKS5 问候只提供无鉴权方式", _sk5.sent.startswith(b"\x05\x01\x00"), _sk5.sent[:8])
+check("socks5h 以域名(ATYP=0x03)发出，交代理远端解析",
+      b"\x05\x01\x00\x03\x0bexample.com\x00\x50" in _sk5.sent, _sk5.sent)
+
+# SOCKS5 用户名密码鉴权（0x02）：校验子协商字节
+_sk5a = _FakeSock([b"\x05\x02", b"\x01\x00",
+                   b"\x05\x00\x00\x01\x7f\x00\x00\x01\x00\x50"])
+_p5a = N.parse_proxy_url("socks5://alice:s3cr3t@10.0.0.9:1080")
+_with_fake_socket(_sk5a, lambda: N.tunnel_socket(_p5a, "1.2.3.4", 80))
+check("SOCKS5 提供无鉴权+用户名密码两种方式",
+      _sk5a.sent.startswith(b"\x05\x02\x00\x02"), _sk5a.sent[:8])
+check("SOCKS5 鉴权子协商字节正确",
+      b"\x01\x05alice\x06s3cr3t" in _sk5a.sent, _sk5a.sent)
+
+# SOCKS5 鉴权被拒
+_sk5bad = _FakeSock([b"\x05\x02", b"\x01\x01"])
+try:
+    _with_fake_socket(_sk5bad, lambda: N.tunnel_socket(_p5a, "h", 80))
+    _e5 = None
+except N.ProxyTunnelError as _exc:
+    _e5 = _exc
+check("SOCKS5 鉴权失败 -> 明确报错", _e5 is not None and "鉴权失败" in str(_e5),
+      str(_e5))
+
+# SOCKS5 转发被拒（rep=5 connection refused）
+_sk5rep = _FakeSock([b"\x05\x00", b"\x05\x05\x00\x01\x00\x00\x00\x00\x00\x00"])
+try:
+    _with_fake_socket(_sk5rep, lambda: N.tunnel_socket(_p5, "h", 80))
+    _e5r = None
+except N.ProxyTunnelError as _exc:
+    _e5r = _exc
+check("SOCKS5 rep=5 -> 转发被拒并给中文原因",
+      _e5r is not None and "连接被拒绝" in str(_e5r), str(_e5r))
+
+# 代理本身连不上（无需网络：127.0.0.1 上不监听的端口）
+_unreach = N.parse_proxy_url("socks5h://127.0.0.1:9")
+try:
+    N.tunnel_socket(_unreach, "example.com", 80, timeout=0.5)
+    _eu = None
+except N.ProxyTunnelError as _exc:
+    _eu = _exc
+check("代理不可达 -> ProxyTunnelError(connect)，不回退直连",
+      _eu is not None and _eu.stage == "connect", str(_eu))
+
+# --- 30.5 opener 零直连出口（关键防泄漏保证） ------------------------------
+_op = N.build_opener(N.parse_proxy_url("socks5h://u:p@1.2.3.4:1080"))
+_handlers = {type(h).__name__ for h in set(
+    h for lst in _op.handle_open.values() for h in lst)}
+check("opener 的 http/https 路由里没有裸 HTTPHandler/HTTPSHandler",
+      "HTTPHandler" not in _handlers and "HTTPSHandler" not in _handlers, _handlers)
+check("opener 的 http 路由只有隧道 handler",
+      [type(h).__name__ for h in _op.handle_open.get("http", [])]
+      == ["ProxyTunnelHTTPHandler"])
+check("opener 的 https 路由只有隧道 handler",
+      [type(h).__name__ for h in _op.handle_open.get("https", [])]
+      == ["ProxyTunnelHTTPHandler"])
+# 环境代理不得接管：设了 HTTP(S)_PROXY，opener 仍只认隧道（对比默认 opener 会读环境）
+import os as _os
+_saved_env = {k: _os.environ.get(k) for k in ("HTTP_PROXY", "HTTPS_PROXY")}
+_os.environ["HTTP_PROXY"] = "http://env-proxy.invalid:3128"
+_os.environ["HTTPS_PROXY"] = "http://env-proxy.invalid:3128"
+try:
+    _op2 = N.build_opener(N.parse_proxy_url("socks5h://u:p@1.2.3.4:1080"))
+    _env_ignored = (
+        [type(h).__name__ for h in _op2.handle_open.get("https", [])]
+        == ["ProxyTunnelHTTPHandler"])
+finally:
+    for _k, _v in _saved_env.items():
+        if _v is None:
+            _os.environ.pop(_k, None)
+        else:
+            _os.environ[_k] = _v
+check("环境变量 HTTP(S)_PROXY 不能接管账号代理 opener", _env_ignored)
+check("open_url(None, ...) 走原直连路径", N.open_url.__doc__ is not None)
+
+# --- 30.6 Account 代理字段 / fail-closed / 熔断 -----------------------------
+_a = A.Account({"uid": "px1", "realm": "cn", "accessToken": "dt-x",
+                "proxy": "socks5h://u:p@1.2.3.4:1080"})
+check("Account 读取 proxy 字段", _a.proxy == "socks5h://u:p@1.2.3.4:1080")
+check("配置代理时 net_opener 非空", _a.net_opener() is not None)
+check("proxy_public 脱敏且标记已配置",
+      _a.proxy_public()["set"] and "p@" not in _a.proxy_public()["masked"])
+check("to_dict 持久化 proxy", _a.to_dict()["proxy"] == _a.proxy)
+_a.save(os.environ["ACCOUNTS_DIR"])
+_reload = A.Account(json.load(open(_a.path, encoding="utf-8")), _a.path)
+check("proxy 落盘后可回读", _reload.proxy == _a.proxy)
+
+_direct = A.Account({"uid": "px0", "realm": "cn", "accessToken": "dt-x"})
+check("未配代理 net_opener 为 None（保持直连原行为）", _direct.net_opener() is None)
+check("未配代理 proxy_public.set 为 False", _direct.proxy_public()["set"] is False)
+
+# 代理账号跳过原生桥：即使原生桥可用也必须走派生身份
+_orig_native = A.native_machine_identity
+A.native_machine_identity = lambda *a, **k: (_ for _ in ()).throw(
+    AssertionError("代理账号不应调用原生桥"))
+try:
+    _h = _a.desktop_headers()
+    _skipped = True
+finally:
+    A.native_machine_identity = _orig_native
+check("代理账号跳过官方原生桥（防宿主机 IP 经 exe 泄漏）", _skipped)
+check("跳过原生桥时身份来源为 derived", _a.machine_identity_source == "derived")
+
+# 熔断：连续失败达阈值自动暂停（fail-closed）
+_b = A.Account({"uid": "px2", "realm": "cn", "accessToken": "dt-x",
+                "proxy": "socks5h://u:p@127.0.0.1:9"})
+_still_enabled = True
+for _i in range(A.PROXY_PAUSE_THRESHOLD - 1):
+    _b.note_proxy_failure("连接被拒绝")
+    if not _b.enabled:
+        _still_enabled = False
+check("未达阈值前不暂停（%d 次）" % (A.PROXY_PAUSE_THRESHOLD - 1), _still_enabled)
+check("未达阈值前计数正确", _b.proxy_failures == A.PROXY_PAUSE_THRESHOLD - 1)
+_b.note_proxy_failure("连接被拒绝")
+check("连续代理失败达阈值 -> 账号自动暂停", _b.enabled is False)
+check("暂停原因写明绝不回退直连", "绝不回退直连" in _b.last_error, _b.last_error)
+check("熔断账号 ready() 为 False（池不会再选中它直连）", _b.ready() is False)
+_paused_raised = False
+try:
+    _b.net_opener()
+except N.ProxyPausedError:
+    _paused_raised = True
+check("已熔断账号 net_opener 抛 ProxyPausedError（请求未出网）", _paused_raised)
+check("熔断状态在 proxy_public 可见", _b.proxy_public()["paused"] is True)
+_b.clear_error()
+check("重新启用清零熔断计数", _b.proxy_failures == 0)
+check("清零后 net_opener 恢复可用", _b.net_opener() is not None)
+
+# 一次成功清零计数
+_c = A.Account({"uid": "px3", "realm": "cn", "accessToken": "dt-x",
+                "proxy": "socks5h://u:p@1.2.3.4:1080"})
+_c.note_proxy_failure("x")
+check("成功前计数为 1", _c.proxy_failures == 1)
+_c.note_proxy_success()
+check("一次成功 -> 计数清零", _c.proxy_failures == 0 and _c.proxy_last_error == "")
+
+# set_proxy 校验非法配置且不改动原值
+_d = A.Account({"uid": "px4", "realm": "cn", "accessToken": "dt-x"})
+try:
+    _d.set_proxy("not-a-url")
+    _bad_raised = False
+except ValueError:
+    _bad_raised = True
+check("set_proxy 拒绝非法配置", _bad_raised and _d.proxy == "")
+_d.set_proxy("http://u:p@h:8080")
+check("set_proxy 接受合法配置", _d.proxy == "http://u:p@h:8080")
+_d.set_proxy("")
+check("set_proxy 空串 = 清空为直连", _d.proxy == "")
+
+# --- 30.7 http_json 代理接入：失败熔断且不直连 ------------------------------
+_e = A.Account({"uid": "px5", "realm": "cn", "accessToken": "dt-x",
+                "proxy": "socks5h://u:p@127.0.0.1:9"})
+_proxy_raised = False
+try:
+    A.http_json("https://openapi.qoder.com.cn/api/v1/userinfo", method="GET",
+                headers={}, timeout=2, retries=1, account=_e)
+except N.ProxyTunnelError:
+    _proxy_raised = True
+check("http_json 经死代理 -> ProxyTunnelError（绝不回退直连）", _proxy_raised)
+check("http_json 失败计入代理熔断计数", _e.proxy_failures == 1, _e.proxy_failures)
+check("http_json 代理失败不设上游错误冷却（不是上游的锅）",
+      _e.cooldown_until == 0, _e.cooldown_until)
+check("代理失败原因已记录且脱敏", "127.0.0.1:9" in _e.proxy_last_error
+      and "u:p" not in _e.proxy_last_error, _e.proxy_last_error)
+check("http_json 无账号时保持直连语义（opener=None 不报错路径）",
+      A.http_json.__doc__ is not None)
+
+# --- 30.8 导入/导出携带代理 ------------------------------------------------
+_row = A.normalise_import_row({"accessToken": "dt-z", "uid": "imp1", "realm": "cn",
+                               "proxy": "socks5h://u:p@1.2.3.4:1080"})
+check("导入行读取 proxy", _row["proxy"] == "socks5h://u:p@1.2.3.4:1080")
+_bad_row = False
+try:
+    A.normalise_import_row({"accessToken": "dt-z", "uid": "imp2", "realm": "cn",
+                            "proxy": "garbage"})
+except ValueError:
+    _bad_row = True
+check("导入行非法代理 -> ValueError（坏行而非静默直连）", _bad_row)
+
+_exp_acct = A.Account({"uid": "exp1", "realm": "cn", "accessToken": "dt-secret",
+                       "proxy": "socks5h://u:p@1.2.3.4:1080"})
+_doc_full = A.build_export_document([_exp_acct], include_secrets=True)
+check("全量导出保留 proxy（导入后可直接用）",
+      _doc_full["accounts"][0].get("proxy") == "socks5h://u:p@1.2.3.4:1080")
+_doc_masked = A.build_export_document([_exp_acct], include_secrets=False)
+check("脱敏导出剥离 proxy（防代理凭据泄漏）",
+      "proxy" not in _doc_masked["accounts"][0])
+check("脱敏导出同时剥离 accessToken",
+      "accessToken" not in _doc_masked["accounts"][0])
+
+# AccountPool.set_proxy 端到端（用临时目录，不碰真实账号）
+import tempfile as _tempfile
+with _tempfile.TemporaryDirectory() as _td:
+    _pool = A.AccountPool(_td)
+    _pa = A.Account({"uid": "pool1", "realm": "cn", "accessToken": "dt-x"})
+    _pool.add(_pa)
+    _pub = _pool.set_proxy("pool1", "socks5h://u:p@1.2.3.4:1080")
+    check("AccountPool.set_proxy 返回脱敏视图且无明文",
+          _pub and _pub["proxy"]["set"] and "p@" not in _pub["proxy"]["masked"], _pub)
+    check("set_proxy 后落盘（重载仍在）",
+          A.Account(json.load(open(_pool.get("pool1").path, encoding="utf-8"))).proxy
+          == "socks5h://u:p@1.2.3.4:1080")
+    _cleared = _pool.set_proxy("pool1", "")
+    check("AccountPool.set_proxy 空串清空", _cleared["proxy"]["set"] is False)
+    _pool_raised = False
+    try:
+        _pool.set_proxy("pool1", "bad")
+    except ValueError:
+        _pool_raised = True
+    check("AccountPool.set_proxy 拒绝非法配置", _pool_raised)
+    check("AccountPool.set_proxy 未知 uid -> None", _pool.set_proxy("nope", "x") is None)
+
+# --- 30.9 网关侧识别代理错误并给出独立错误类型 -------------------------------
+# friendly_upstream_error 处理上游错误；代理错误另走 proxy_error 分支（见
+# qoder_proxy 的 chat 处理器）。这里验证分类函数不把代理错误误判成上游瞬时故障，
+# 否则会触发"换域名重试"这种对死代理毫无意义的动作。
+_proxy_exc = N.ProxyTunnelError("连接代理失败", stage="connect")
+check("_is_transient_transport 不吞掉代理错误（由 is_proxy_error 先行判别）",
+      N.is_proxy_error(_proxy_exc) is True)
+check("代理错误被 wrap 后仍可识别（URLError 形态）",
+      N.is_proxy_error(urllib.error.URLError(_proxy_exc)) is True)
+check("代理错误文本用于客户端提示（脱敏后）",
+      "连接代理失败" in N.error_text(_proxy_exc))
 
 print()
 print("SUMMARY: PASS=%d FAIL=%d" % (PASS, FAIL))
