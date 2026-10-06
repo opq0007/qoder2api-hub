@@ -14,6 +14,10 @@ __pycache__/
 # ---- 本地工具 / 临时文件 ----
 .mimosa/
 .codegraph/
+.team/
+
+# ---- 自动提取的原生组件（体积大、平台相关，由 _install_umid.py 生成）----
+umid/
 _shots/
 *.log
 _tmp_*

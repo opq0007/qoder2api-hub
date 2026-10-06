@@ -24,6 +24,26 @@
 
 推理端点固定携带 cosy-* 头（machineid/machinetoken/machinetype/date/key/user/...），
 x-model-key 决定上游模型路由。会话按账号缓存，access token 轮换后重建。
+
+已知强度风险（只标注、不单方面加固：现状 / 为什么不能改 / 真要改的前提）：
+  1. 会话密钥熵偏低：temp_key = uuid.uuid4().hex[:16]（本文件 540 行附近）只有
+     16 个十六进制字符 = 64 bit 熵，字符集仅 [0-9a-f]，再整体作为 UTF-8 字节
+     充当 AES-128 的 key/iv（key == iv）。名义 AES-128，有效强度约 64 bit。
+     不能单方面改：temp_key 的字节序列必须与服务端侧解包结果逐字节一致——服务端
+     用官方 RSA 私钥解出 cosy-key，再以同一串字节解 info；长度或编码一变，info
+     直接解不开、请求整体失败（无降级路径）。
+     真要改的前提：① 先用真实账号做端到端回归（发一条 chat，观察 200 与 SSE 数据）；
+     ② 改用 os.urandom(16) 随机字节（熵 64 -> 128 bit，key 长度仍是 16 字节）并验证
+     服务端不依赖 ASCII/hex 形态；③ Lead 批准 + 全量账号灰度 + 保留回滚点。
+  2. RSA 包裹密钥过短：SERVER_PUB_PEM（本文件 442 行附近）是官方客户端硬编码公钥，
+     实测 _RSA_N.bit_length() == 1024、e == 65537，配 PKCS#1 v1.5 (type 2) 加密。
+     1024 位低于当代推荐（NIST 建议不低于 2048 位），且 v1.5 不具备 IND-CCA 安全性；
+     但本链路密文只上行、客户端侧不暴露解密预言机，实际可攻击面受限。
+     不能单方面改：公钥必须与官方私钥配对，客户端换更长密钥在数学上不可能，
+     属协议层决策。
+     真要改的前提：官方客户端更换公钥（届时替换 SERVER_PUB_PEM 与相应 cosy 版本）。
+  上述两条均源自"与官方协议对齐"，不得为"加固"而单方面偏离兼容性；
+  详见 .team/doudou.md 风险 R3 与不变量章节。
 """
 import base64
 import hashlib
@@ -505,11 +525,6 @@ def rsa_pkcs1v15_encrypt(plain: bytes, n: int = None, e: int = None) -> bytes:
 COSY_VERSION = "1.1.64"
 DEFAULT_USER_TYPE = "personal_professional_trial"
 
-_IDENTITY_KEYS = (
-    "name", "aid", "uid", "yx_uid", "organization_id",
-    "organization_name", "user_type", "security_oauth_token", "refresh_token",
-)
-
 
 def json_sorted_compact(mapping: dict) -> bytes:
     """键排序 + 无空白的紧凑 JSON（服务端签名字节与此强绑定）。"""
@@ -541,6 +556,8 @@ class CosySession(object):
         self.cosy_key = base64.b64encode(
             rsa_pkcs1v15_encrypt(self.temp_key.encode("utf-8"))
         ).decode("ascii")
+        # 身份体 9 键（唯一真源）：此前另有模块级 _IDENTITY_KEYS 常量副本，
+        # 全仓零引用且存在双源漂移风险，已在本轮清理；增删键必须同步服务端预期。
         identity = {
             "name": nickname or "",
             "aid": self.uid,

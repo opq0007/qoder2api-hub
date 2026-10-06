@@ -18,11 +18,18 @@ import time
 
 
 def derive_id(uid: str, salt: str) -> str:
-    """由 uid + salt 稳定派生一个 36 位十六进制设备/会话标识。
+    """由 uid + salt 稳定派生一个 32 位十六进制设备/会话标识。
 
     幂等：同一账号每次调用产生相同值，彻底避免随机机器码导致的上游风控。
+
+    长度事实（勿"顺手修正"）：md5().hexdigest() 恒为 32 个十六进制字符，
+    因此 [:36] 是防御性切片（对 32 长串为恒等），实际输出恒为 32 位；
+    旧注释写作"36 位"属文档漂移，已在本轮与实现对齐。
+    若要补齐到 36 位（UUID 形态），会改变所有已入池账号的 machineId /
+    sessionId，属破坏性变更：必须 Lead 批准 + 全量账号回归，禁止单方面修改。
     """
     seed = f"{salt}:{uid or 'anonymous'}"
+    # md5 hexdigest 恒为 32 字符；[:36] 是恒等切片（防御性保留，结果不变）
     return hashlib.md5(seed.encode("utf-8")).hexdigest()[:36]
 
 

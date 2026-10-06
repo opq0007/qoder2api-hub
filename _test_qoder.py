@@ -6,6 +6,20 @@ body construction, SSE envelope unwrapping, Responses-API custom-tool
 translation, and check-in response normalization.
 
     python _test_qoder.py
+
+外部 fixture（可选）：[4.5] 组的官方加解密 KAT 需要协议 fixture 目录
+（内含 credential.json 与 model-cache.json）。目录按以下顺序自动探测：
+    1) 环境变量 QD_TEST_FIXTURE_DIR
+    2) <仓库>/testdata/protocol/1.1.34
+    3) <仓库>/tests/fixtures/protocol/1.1.34
+    4) <仓库>/../qoder-ref/cli2api/testdata/protocol/1.1.34
+    5) %TEMP%/qoder-ref/cli2api/testdata/protocol/1.1.34
+    6) ~/qoder-ref/cli2api/testdata/protocol/1.1.34
+缺 fixture 时依赖它的 3 条断言打印 [SKIP]（不计失败），**绝不静默**：
+[SKIP] 行、候选清单、末行汇总都会报出跳过数量。同组的 AES-256
+密钥表 / 互逆 KAT 不依赖 fixture，永远执行。
+
+退出码：0 = 无 FAIL（允许存在 SKIP）；1 = 存在 FAIL。
 """
 import hashlib
 import json
@@ -30,7 +44,7 @@ import qoder_accounts as A
 import qoder_tasks as T
 import qoder_net as N
 
-PASS = FAIL = 0
+PASS = FAIL = SKIP = 0
 
 
 def check(label, cond, extra=""):
@@ -41,6 +55,17 @@ def check(label, cond, extra=""):
     else:
         FAIL += 1
         print("  [FAIL] " + label + ("  " + str(extra) if extra else ""))
+
+
+def skip(label, reason=""):
+    """显式跳过（缺外部 fixture / 缺环境），绝不静默。
+
+    SKIP 不改变退出码（退出码只看 FAIL），但会打印醒目行并计入末行汇总，
+    所以"这组没跑"永远可见；补齐 fixture 后必须重跑到它真的 PASS。
+    """
+    global SKIP
+    SKIP += 1
+    print("  [SKIP] " + label + (("  -- " + str(reason)) if reason else ""))
 
 
 print("[1] Qoder custom base64 variant")
@@ -1350,9 +1375,44 @@ check("job family", A.token_family(acc_j) == "job")
 print()
 print("[4.5] credential / model-cache crypto KATs (official fixtures)")
 import base64 as _b64
-_FIX = r"C:\Users\shuishui\AppData\Local\Temp\qoder-ref\cli2api\testdata\protocol\1.1.34"
-if os.path.isdir(_FIX):
-    fx = json.load(open(os.path.join(_FIX, "credential.json"), encoding="utf-8"))
+# fixture 探测：环境变量优先，其次按候选顺序找；不再硬编码单个 %TEMP% 路径。
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_FIX_ENV = os.environ.get("QD_TEST_FIXTURE_DIR") or ""
+_FIX_CANDIDATES = [
+    _FIX_ENV,
+    os.path.join(_HERE, "testdata", "protocol", "1.1.34"),
+    os.path.join(_HERE, "tests", "fixtures", "protocol", "1.1.34"),
+    os.path.join(_HERE, os.pardir, "qoder-ref", "cli2api", "testdata",
+                 "protocol", "1.1.34"),
+    os.path.join(os.environ.get("TEMP") or os.environ.get("TMP") or "/tmp",
+                 "qoder-ref", "cli2api", "testdata", "protocol", "1.1.34"),
+    os.path.join(os.path.expanduser("~"), "qoder-ref", "cli2api",
+                 "testdata", "protocol", "1.1.34"),
+]
+if _FIX_ENV and not os.path.isdir(_FIX_ENV):
+    print("  [WARN] QD_TEST_FIXTURE_DIR 指向的目录不存在：%s" % _FIX_ENV)
+_FIX, _FIX_TRIED = "", []
+for _cand in _FIX_CANDIDATES:
+    if not _cand:
+        continue
+    _cand_abs = os.path.abspath(_cand)
+    _FIX_TRIED.append(_cand_abs)
+    if os.path.isdir(_cand_abs):
+        _FIX = _cand_abs
+        break
+if _FIX:
+    print("  fixture 目录: %s" % _FIX)
+else:
+    print("  fixture 目录: 未找到；已探测 %d 条候选：" % len(_FIX_TRIED))
+    for _p in _FIX_TRIED:
+        print("      -  %s" % _p)
+    print("      指定方式: QD_TEST_FIXTURE_DIR=<dir> python _test_qoder.py")
+
+_CRED_FP = os.path.join(_FIX, "credential.json") if _FIX else ""
+_MCACHE_FP = os.path.join(_FIX, "model-cache.json") if _FIX else ""
+
+if _CRED_FP and os.path.isfile(_CRED_FP):
+    fx = json.load(open(_CRED_FP, encoding="utf-8"))
     mkey = fx["input"]["machine_key"].encode()
     fx_ct = _b64.b64decode(fx["expected"]["encrypted"])
     dec = S.aes_cbc_decrypt(fx_ct, mkey, mkey)
@@ -1361,19 +1421,28 @@ if os.path.isdir(_FIX):
     enc = _b64.b64encode(S.aes_cbc_encrypt(dec, mkey, mkey)).decode()
     check("credential fixture encrypt byte-exact",
           enc == fx["expected"]["encrypted"])
-    mf = json.load(open(os.path.join(_FIX, "model-cache.json"), encoding="utf-8"))
+else:
+    _miss_cred = "缺 credential.json" if _FIX else "缺 fixture 目录"
+    skip("credential fixture decrypt byte-exact", _miss_cred)
+    skip("credential fixture encrypt byte-exact", _miss_cred)
+
+if _MCACHE_FP and os.path.isfile(_MCACHE_FP):
+    mf = json.load(open(_MCACHE_FP, encoding="utf-8"))
     plain = S.qmc_decrypt(mf["expected"]["encrypted"], mf["input"]["uid"])
     check("model-cache (QMC v1) fixture decrypt byte-exact",
           plain.decode() == mf["expected"]["decrypted"])
-    # AES-256 互逆（QMC 用 32 字节 key -> 14 轮）
-    k256 = bytes(range(32))
-    blk = bytes(range(16))
-    rks = S._expand_key(k256)
-    check("AES-256 key schedule = 15 round keys", len(rks) == 15, len(rks))
-    check("AES-256 block roundtrip",
-          S._decrypt_block(S._encrypt_block(blk, rks), rks) == blk)
 else:
-    check("official crypto fixtures present", False, _FIX)
+    skip("model-cache (QMC v1) fixture decrypt byte-exact",
+         "缺 model-cache.json" if _FIX else "缺 fixture 目录")
+
+# AES-256 互逆（QMC 用 32 字节 key -> 15 个轮密钥）：纯算法、不依赖 fixture，
+# 因此永远执行（此前被误放进 fixture 分支，缺 fixture 时连算法 KAT 都一起没跑）。
+k256 = bytes(range(32))
+blk = bytes(range(16))
+rks = S._expand_key(k256)
+check("AES-256 key schedule = 15 round keys", len(rks) == 15, len(rks))
+check("AES-256 block roundtrip",
+      S._decrypt_block(S._encrypt_block(blk, rks), rks) == blk)
 
 print()
 print("[4.6] local credential scan (reads THIS machine's official stores)")
@@ -1605,10 +1674,18 @@ _hdrs = _t_cn.desktop_headers()
 check("desktop headers carry Cosy-ClientType=10 + Cosy-Version + UA Qoder",
       _hdrs["cosy-clienttype"] == "10" and _hdrs["User-Agent"] == "Qoder"
       and bool(_hdrs["cosy-version"]), _hdrs.get("cosy-clienttype"))
-check("desktop headers carry the machine identity set",
-      all(_hdrs.get(k) for k in ("cosy-machineid", "cosy-machinetoken",
-                                 "cosy-machinetype", "cosy-machineos",
-                                 "cosy-machinehostname", "cosy-machinecode")))
+# 前提：文件头已设 QD_NATIVE_IDENTITY=0，且本机 runtime_info_exe("cn") 返回空 ->
+# 本进程内的身份来源必为 "derived"（:1679 那条断言独立守这一点）。
+# issue #10：**derived** 身份不得携带 cosy-machine* 六头——服务端一旦看到一整套
+# 派生机器头，就会把 CN 的「每日领取 100 Credits」等可领取活动整条过滤掉（列表变空）。
+# 语义 = 服务端可见值必须为空/缺失（实现删除键或置空都满足）；"能红"面 = 回退成
+# 无条件发头即失败。
+_MACHINE_HDRS20 = ("cosy-machineid", "cosy-machinetoken", "cosy-machinetype",
+                   "cosy-machineos", "cosy-machinehostname", "cosy-machinecode")
+check("derived 身份不得发送 cosy-machine* 六头（issue #10：全套派生机器头会让服务端"
+      "过滤掉可领取的 Credits 活动）",
+      not any(_hdrs.get(k) for k in _MACHINE_HDRS20),
+      {k: _hdrs.get(k) for k in _MACHINE_HDRS20 if _hdrs.get(k)})
 check("native identity bridge can be disabled (derived fallback)",
       os.environ.get("QD_NATIVE_IDENTITY") == "0"
       and _t_cn.machine_identity_source == "derived"
@@ -1616,6 +1693,24 @@ check("native identity bridge can be disabled (derived fallback)",
       _t_cn.machine_identity_source)
 check("desktop headers keep the Bearer token",
       _hdrs["Authorization"].startswith("Bearer "))
+# issue #10 的正向面：修复只能收窄 derived，**native 原生身份必须照旧发六头**。
+# 打桩原生身份返回值（当前 desktop_headers 以 native_machine_identity() 的返回
+# 为判据；若实现改判据，这条会红——这正是要它守住的契约）。
+_orig_nmi20 = A.native_machine_identity
+try:
+    A.native_machine_identity = lambda realm, account_id, force=False: {
+        "machineToken": "nt-token", "machineType": "3",
+        "machineCode": "nc-1", "source": "runtime-info"}
+    _t_native20 = A.Account({"uid": "h20native", "realm": "cn",
+                             "accessToken": "dt-x"})
+    _h_native20 = _t_native20.desktop_headers()
+finally:
+    A.native_machine_identity = _orig_nmi20
+check("原生桥身份分支（source=runtime-info）仍发送 cosy-machine* 六头"
+      "（issue #10 只收窄 derived，不砍原生能力）",
+      _t_native20.machine_identity_source == "runtime-info"
+      and all(_h_native20.get(k) for k in _MACHINE_HDRS20),
+      {k: _h_native20.get(k) for k in _MACHINE_HDRS20})
 check("campaign claim/reward path templates (official growth-page contract)",
       A.PATH_CAMPAIGN_CLAIM == "/sash/api/v1/me/campaigns/%s/claim"
       and A.PATH_CAMPAIGN_REWARD == "/sash/api/v1/me/campaigns/%s/reward")
@@ -1760,7 +1855,10 @@ def _stub_native(realm, account_id, force=False):
 A.Account._campaigns_get = _stub_get
 A.native_machine_identity = _stub_native
 _acc25 = A.Account({"uid": "cp25", "realm": "cn", "accessToken": "dt-x"})
-_acc25.machine_identity_source = "native"
+# Lead 口径裁决：machine_identity_source 合法值只有 "runtime-info"（原生桥可用）
+# 与 "derived"（回退）；此处桩值必须是真实取值——过去写成 "native" 会让实现里
+# 永不命中的死逻辑（== "native"）被测试掩盖成"已验证"。
+_acc25.machine_identity_source = "runtime-info"
 try:
     _st25 = _acc25.campaigns()
 finally:
@@ -1774,13 +1872,18 @@ check("retry keeps the second (populated) payload",
       len(_st25.get("campaigns") or []) == 1
       and _st25["campaigns"][0]["campaign_key"] == "act-x")
 
-# --- 20.6 campaign_checkin 先强制刷新身份（轮换后不漏领） ---
+# --- 20.6 campaign_checkin 走【缓存优先】的身份链路 ---
+# 设计 §9.1（身份落盘缓存）明确废除"每次领取都 force 刷新"：那会每次把落盘缓存
+# 刷成新身份，直接违背"重建不换"的目标。新语义＝照常走身份链路但【不传 force】，
+# 由 native_machine_identity 的缓存优先逻辑决定是否真的调组件。
 _orig_get2 = A.Account._campaigns_get
 _orig_native2 = A.native_machine_identity
+_calls2 = []
 _forced2 = []
 
 
 def _stub_native2(realm, account_id, force=False):
+    _calls2.append((realm, account_id))
     if force:
         _forced2.append(account_id)
     return {"machineToken": "t", "machineType": "ty", "machineCode": "c",
@@ -1797,8 +1900,9 @@ try:
 finally:
     A.Account._campaigns_get = _orig_get2
     A.native_machine_identity = _orig_native2
-check("campaign_checkin force-refreshes the machine identity first",
-      _forced2 == ["cp26"], _forced2)
+check("campaign_checkin 不 force：走缓存优先链路（设计 §9.1 废除每次领取换身份）",
+      _forced2 == [] and len(_calls2) >= 1 and _calls2[0] == ("cn", "cp26"),
+      (_forced2, _calls2))
 
 # --- 20.4 思考档位归一化（官方词表因模型而异，未命中会被上游静默忽略） ---
 _meta_df = next(m for m in C.models_for_realm("cn") if m["key"] == "dfmodel")
@@ -2427,8 +2531,13 @@ check("不带 only_kinds：积分与券类都领",
 # --- 25.3 面板/接口接线：账号面板走 only_daily，福利中心走全量 ---
 _src25 = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
                            "qoder_proxy.py"), encoding="utf-8").read()
-check("账号面板 /accounts/checkin 只做每日签到",
-      "run_checkin(account, gap=0.4, only_daily=True)" in _src25)
+check("账号面板 /accounts/checkin 只做每日签到，且间隔传 CHECKIN_MIN_GAP 常量本身",
+      # 恢复被弱化的精确语义：调用点必须写 CHECKIN_MIN_GAP，常量定义值必须与
+      # **运行时** P.CHECKIN_MIN_GAP 一致（引用运行时值，不把 1.0 硬编码进字符串，
+      # 下次调间隔只改实现一处）。
+      "run_checkin(account, gap=CHECKIN_MIN_GAP" in _src25
+      and "only_daily=True" in _src25
+      and ("CHECKIN_MIN_GAP = %r" % P.CHECKIN_MIN_GAP) in _src25)
 check("签到与福利中心 /tasks/run 仍是全量领取",
       "run_batch_checkin(targets, gap=1.0)" in _src25)
 _dash25 = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -2498,9 +2607,9 @@ _src26 = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
 check("三处信封捕获点都接入账号冷却",
       _src26.count("_handle_envelope_account_cooldown(") >= 4,
       _src26.count("_handle_envelope_account_cooldown("))
-print("[27] 账号级 IP 代理：URL 解析 / 脱敏 / 隧道握手 / fail-closed / 熔断")
+print("[34] 账号级 IP 代理：URL 解析 / 脱敏 / 隧道握手 / fail-closed / 熔断")
 
-# --- 27.1 URL 解析 ----------------------------------------------------------
+# --- 34.1 URL 解析 ----------------------------------------------------------
 check("空代理 -> None", N.parse_proxy_url("") is None)
 check("空白代理 -> None", N.parse_proxy_url("   ") is None)
 _p = N.parse_proxy_url("socks5h://alice:s3cr3t@1.2.3.4:1080")
@@ -2527,7 +2636,7 @@ for _bad in ("1.2.3.4:1080", "ftp://h:1", "http://h", "http://:1080",
         _raised = True
     check("非法代理被拒绝: %r" % _bad, _raised)
 
-# --- 27.2 脱敏（日志/看板绝不出现明文凭据） --------------------------------
+# --- 34.2 脱敏（日志/看板绝不出现明文凭据） --------------------------------
 _masked = N.parse_proxy_url("socks5h://alice:s3cr3t@1.2.3.4:1080").mask()
 check("脱敏串不含密码", "s3cr3t" not in _masked, _masked)
 check("脱敏串不含完整用户名", "alice" not in _masked, _masked)
@@ -2536,7 +2645,7 @@ check("脱敏串保留 scheme/host/port",
 check("mask_proxy 对原始串脱敏", "s3cr3t" not in N.mask_proxy("http://u:s3cr3t@h:8080"))
 check("mask_proxy 空串 -> 空", N.mask_proxy("") == "")
 
-# --- 27.3 is_proxy_error / error_text --------------------------------------
+# --- 34.3 is_proxy_error / error_text --------------------------------------
 check("ProxyTunnelError 被识别", N.is_proxy_error(N.ProxyTunnelError("x", "auth")))
 check("ProxyPausedError 被识别", N.is_proxy_error(N.ProxyPausedError("paused")))
 check("URLError 包装的代理错误被识别",
@@ -2547,7 +2656,7 @@ check("HTTPError 不被误判为代理错误",
 check("error_text 剥掉 URLError 包装",
       "boom" in N.error_text(urllib.error.URLError(N.ProxyTunnelError("boom"))))
 
-# --- 27.4 隧道握手（离线：用假 socket 注入脚本） ----------------------------
+# --- 34.4 隧道握手（离线：用假 socket 注入脚本） ----------------------------
 class _FakeSock(object):
     """按脚本吐出 recv 数据、记录 sendall 字节的假 socket。"""
 
@@ -2657,7 +2766,7 @@ except N.ProxyTunnelError as _exc:
 check("代理不可达 -> ProxyTunnelError(connect)，不回退直连",
       _eu is not None and _eu.stage == "connect", str(_eu))
 
-# --- 27.5 opener 零直连出口（关键防泄漏保证） ------------------------------
+# --- 34.5 opener 零直连出口（关键防泄漏保证） ------------------------------
 _op = N.build_opener(N.parse_proxy_url("socks5h://u:p@1.2.3.4:1080"))
 _handlers = {type(h).__name__ for h in set(
     h for lst in _op.handle_open.values() for h in lst)}
@@ -2688,7 +2797,7 @@ finally:
 check("环境变量 HTTP(S)_PROXY 不能接管账号代理 opener", _env_ignored)
 check("open_url(None, ...) 走原直连路径", N.open_url.__doc__ is not None)
 
-# --- 27.6 Account 代理字段 / fail-closed / 熔断 -----------------------------
+# --- 34.6 Account 代理字段 / fail-closed / 熔断 -----------------------------
 _a = A.Account({"uid": "px1", "realm": "cn", "accessToken": "dt-x",
                 "proxy": "socks5h://u:p@1.2.3.4:1080"})
 check("Account 读取 proxy 字段", _a.proxy == "socks5h://u:p@1.2.3.4:1080")
@@ -2762,7 +2871,7 @@ check("set_proxy 接受合法配置", _d.proxy == "http://u:p@h:8080")
 _d.set_proxy("")
 check("set_proxy 空串 = 清空为直连", _d.proxy == "")
 
-# --- 27.7 http_json 代理接入：失败熔断且不直连 ------------------------------
+# --- 34.7 http_json 代理接入：失败熔断且不直连 ------------------------------
 _e = A.Account({"uid": "px5", "realm": "cn", "accessToken": "dt-x",
                 "proxy": "socks5h://u:p@127.0.0.1:9"})
 _proxy_raised = False
@@ -2780,7 +2889,7 @@ check("代理失败原因已记录且脱敏", "127.0.0.1:9" in _e.proxy_last_err
 check("http_json 无账号时保持直连语义（opener=None 不报错路径）",
       A.http_json.__doc__ is not None)
 
-# --- 27.8 导入/导出携带代理 ------------------------------------------------
+# --- 34.8 导入/导出携带代理 ------------------------------------------------
 _row = A.normalise_import_row({"accessToken": "dt-z", "uid": "imp1", "realm": "cn",
                                "proxy": "socks5h://u:p@1.2.3.4:1080"})
 check("导入行读取 proxy", _row["proxy"] == "socks5h://u:p@1.2.3.4:1080")
@@ -2825,7 +2934,7 @@ with _tempfile.TemporaryDirectory() as _td:
     check("AccountPool.set_proxy 拒绝非法配置", _pool_raised)
     check("AccountPool.set_proxy 未知 uid -> None", _pool.set_proxy("nope", "x") is None)
 
-# --- 27.9 网关侧识别代理错误并给出独立错误类型 -------------------------------
+# --- 34.9 网关侧识别代理错误并给出独立错误类型 -------------------------------
 # friendly_upstream_error 处理上游错误；代理错误另走 proxy_error 分支（见
 # qoder_proxy 的 chat 处理器）。这里验证分类函数不把代理错误误判成上游瞬时故障，
 # 否则会触发"换域名重试"这种对死代理毫无意义的动作。
@@ -2838,33 +2947,2068 @@ check("代理错误文本用于客户端提示（脱敏后）",
       "连接代理失败" in N.error_text(_proxy_exc))
 
 print()
-print("[28] Dockerfile COPY 白名单覆盖全部运行时模块（含新增模块）")
+print("[35] Dockerfile COPY 白名单覆盖全部运行时模块（含新增模块）")
 # 教训：qoder_net.py 曾漏出 COPY 白名单，本地跑得好好的、Docker 起来就
 # ModuleNotFoundError。这条把"运行时 import 到的本地模块"与 COPY 清单对齐，
 # 新增模块忘加 Dockerfile 时离线测试直接红。
+# 注意：官方镜像刻意不带 Dockerfile/compose（见 Dockerfile 尾部注释），容器内
+# 自检跑到这里时按 SKIP 处理（对齐 [4.5] fixture 缺失的语义，绝不静默失败）。
 import re as _re
-_df = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                        "Dockerfile"), encoding="utf-8").read()
-_df_flat = _df.replace("\\\n", " ")          # 反斜杠续行拼平
-_copied = set()
-for _m in _re.finditer(r"^COPY\s+(.+)$", _df_flat, _re.M):
-    _copied.update(x.strip() for x in _m.group(1).split())
-_runtime = set()
-for _f in ("qoder_proxy.py", "qoder_accounts.py", "qoder_tasks.py",
-           "qoder_scheduler.py", "qoder_catalog.py"):
-    _src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), _f),
-                encoding="utf-8").read()
-    _runtime.update(_re.findall(r"^\s*(?:import|from)\s+(qoder_\w+)", _src,
-                                _re.M))
-_runtime = {m + ".py" for m in _runtime}
-_missing = _runtime - _copied
-check("运行时 import 的本地模块都在 COPY 清单里", not _missing,
-      sorted(_missing) or _copied)
-check("Docker 镜像带看板与请求体模板",
-      {"dashboard.html", "baseprompt.json"} <= _copied)
-check("Docker 镜像带双区模型快照",
-      {"qoder_catalog_intl.json", "qoder_catalog_cn.json"} <= _copied)
+_BASE = os.path.dirname(os.path.abspath(__file__))
+_dockerfile_path = os.path.join(_BASE, "Dockerfile")
+_compose_path = os.path.join(_BASE, "docker-compose.yml")
+if not os.path.exists(_dockerfile_path):
+    skip("Dockerfile COPY 白名单对齐（镜像内无 Dockerfile，构建机/CI 上才跑）",
+         "no Dockerfile beside the test (running inside the image)")
+else:
+    _df = open(_dockerfile_path, encoding="utf-8").read()
+    _df_flat = _df.replace("\\\n", " ")          # 反斜杠续行拼平
+    _copied = set()
+    for _m in _re.finditer(r"^COPY\s+(.+)$", _df_flat, _re.M):
+        _copied.update(x.strip() for x in _m.group(1).split())
+    _runtime = set()
+    for _f in ("qoder_proxy.py", "qoder_accounts.py", "qoder_tasks.py",
+               "qoder_scheduler.py", "qoder_catalog.py"):
+        _src = open(os.path.join(_BASE, _f), encoding="utf-8").read()
+        _runtime.update(_re.findall(r"^\s*(?:import|from)\s+(qoder_\w+)", _src,
+                                    _re.M))
+    _runtime = {m + ".py" for m in _runtime}
+    _missing = _runtime - _copied
+    check("运行时 import 的本地模块都在 COPY 清单里", not _missing,
+          sorted(_missing) or _copied)
+    check("Docker 镜像带看板与请求体模板",
+          {"dashboard.html", "baseprompt.json"} <= _copied)
+    check("Docker 镜像带双区模型快照",
+          {"qoder_catalog_intl.json", "qoder_catalog_cn.json"} <= _copied)
+    # compose 守卫：本 fork 必须默认源码构建。上游把默认改成了拉官方预构建镜像
+    # （不含本 fork 的代理功能），服务器 compose up 会静默跑错镜像——锁死它。
+    _compose = open(_compose_path, encoding="utf-8").read()
+    _active_image = [ln for ln in _compose.splitlines()
+                     if ln.strip().startswith("image:")
+                     and not ln.strip().startswith("#")]
+    check("compose 默认源码构建（不得激活引用上游预构建镜像）",
+          bool([ln for ln in _compose.splitlines()
+                if ln.strip() == "build: ."])
+          and not any("ghcr.io" in ln for ln in _active_image),
+          _active_image)
 
 print()
-print("SUMMARY: PASS=%d FAIL=%d" % (PASS, FAIL))
+print("[27] 泄漏文本回读（issue #8：模型照格式复述 tool_calls 序列化）")
+_M27 = P.LEAK_MARKER
+_CALLS27 = json.dumps([{"name": "terminal",
+                        "arguments": json.dumps({"cmd": "ls"}, ensure_ascii=False)}],
+                      ensure_ascii=False)
+_LEAK27 = _M27 + "\n" + _CALLS27
+
+_rec27, _clean27 = P.parse_leaked_tool_calls(_LEAK27, {"terminal"})
+check("严格形态：marker+JSON 数组 -> 还原为结构化调用且正文清空",
+      bool(_rec27) and _clean27 == ""
+      and _rec27[0]["function"]["name"] == "terminal"
+      and json.loads(_rec27[0]["function"]["arguments"])["cmd"] == "ls",
+      (_rec27, _clean27))
+check("围栏形态（```json ... ```）同样还原",
+      bool(P.parse_leaked_tool_calls("```json\n" + _LEAK27 + "\n```", {"terminal"})[0]))
+check("无语言标记围栏（``` ... ```）同样还原",
+      bool(P.parse_leaked_tool_calls("```\n" + _LEAK27 + "\n```", {"terminal"})[0]))
+check("普通正文（讨论该标记）不误判",
+      P.parse_leaked_tool_calls("网关会写入 " + _M27 + " 这样的提示，不是调用。")[0] is None)
+check("数组后带多余文本不还原",
+      P.parse_leaked_tool_calls(_LEAK27 + "\n以上。", {"terminal"})[0] is None)
+check("未声明的工具名不还原（守卫：只认本次声明的 tools）",
+      P.parse_leaked_tool_calls(_LEAK27, {"other"})[0] is None)
+check("空数组不还原", P.parse_leaked_tool_calls(_M27 + "\n[]")[0] is None)
+check("arguments 为对象 -> 规范化为 JSON 字符串",
+      json.loads(P.parse_leaked_tool_calls(
+          _M27 + "\n" + json.dumps([{"name": "t", "arguments": {"a": 1}}],
+                                   ensure_ascii=False),
+          {"t"})[0][0]["function"]["arguments"]) == {"a": 1})
+check("arguments 非法 JSON 字符串 -> 不还原",
+      P.parse_leaked_tool_calls(
+          _M27 + "\n" + json.dumps([{"name": "t", "arguments": "{not-json"}]),
+          {"t"})[0] is None)
+check("声明工具名提取兼容 chat 与 responses 两种 tools 形态",
+      P._tool_names_from_payload({"tools": [
+          {"type": "function", "function": {"name": "a"}},
+          {"type": "function", "name": "b"}]}) == {"a", "b"})
+
+
+def _raw27(content=None, fin=None, **kw):
+    delta = {}
+    if content is not None:
+        delta["content"] = content
+    delta.update(kw)
+    inner = {"id": "c27", "model": "m27", "created": 1, "choices": [
+        {"index": 0, "delta": delta, "finish_reason": fin}]}
+    return ("data: " + json.dumps(inner, ensure_ascii=False)
+            + "\n\n").encode("utf-8")
+
+
+def _env27(content=None, fin=None, **kw):
+    inner = json.loads(_raw27(content, fin, **kw)[6:])
+    return ("data: " + json.dumps(
+        {"statusCodeValue": 200, "body": json.dumps(inner, ensure_ascii=False)},
+        ensure_ascii=False) + "\n\n").encode("utf-8")
+
+
+class _Resp27:
+    def __init__(self, items):
+        self.items = list(items)
+
+    def __iter__(self):
+        return iter(self.items)
+
+    def close(self):
+        pass
+
+
+_obj27 = P.aggregate_stream(
+    _Resp27([_env27(_LEAK27[:12]), _env27(_LEAK27[12:]),
+             _env27("", "stop")]),
+    "m27", None, allowed_names={"terminal"})
+_msg27 = _obj27["choices"][0]["message"]
+check("非流式聚合：泄漏正文 -> 结构化 tool_calls，finish_reason=tool_calls",
+      _obj27["choices"][0]["finish_reason"] == "tool_calls"
+      and _msg27.get("content") == ""
+      and ((_msg27.get("tool_calls") or [{}])[0].get("function")
+           or {}).get("name") == "terminal", _obj27)
+
+_frames27 = [json.loads(f[6:]) for f in P.recover_leaked_tool_calls(
+    iter([_raw27(_LEAK27[:9]), _raw27(_LEAK27[9:]), _raw27("", "stop")]),
+    {"terminal"})]
+_c27 = [_f["choices"][0] for _f in _frames27]
+check("流式：marker 跨增量分段仍回读为 tool_calls 增量 + 收尾帧改写",
+      not any(_d.get("delta", {}).get("content") for _d in _c27)
+      and any(_d.get("delta", {}).get("tool_calls") for _d in _c27)
+      and _c27[-1]["finish_reason"] == "tool_calls", _c27)
+
+_frames27b = [json.loads(f[6:]) for f in P.recover_leaked_tool_calls(
+    iter([_raw27("[1, 2"), _raw27(", 3] 这是正文"), _raw27("", "stop")]))]
+check("流式：以 [ 开头但被证伪 -> 原样补发正文，不改 finish",
+      "".join(_f["choices"][0]["delta"].get("content") or ""
+              for _f in _frames27b) == "[1, 2, 3] 这是正文"
+      and _frames27b[-1]["choices"][0]["finish_reason"] == "stop", _frames27b)
+
+_frames27c = [json.loads(f[6:]) for f in P.recover_leaked_tool_calls(
+    iter([_raw27(_LEAK27), _raw27("", "stop")]), {"other_tool"})]
+check("流式：未声明工具名 -> 不吞正文，按普通文本透传",
+      "".join(_f["choices"][0]["delta"].get("content") or ""
+              for _f in _frames27c) == _LEAK27, _frames27c)
+
+_ev27 = [f.decode() for f in P.stream_responses_events(
+    iter([_raw27(_LEAK27), _raw27("", "stop")]), "m27",
+    {"usage": None, "custom_names": set(), "allowed_names": {"terminal"}})]
+_parsed27 = [json.loads(_ln[6:]) for _fr in _ev27
+             for _ln in _fr.splitlines() if _ln.startswith("data: ")]
+_text27 = "".join(e.get("delta") or "" for e in _parsed27
+                  if e.get("type") == "response.output_text.delta")
+_fc27 = [e["item"] for e in _parsed27
+         if e.get("type") == "response.output_item.done"
+         and (e.get("item") or {}).get("type") == "function_call"]
+check("Responses 流式：泄漏不回显为 output_text，转为 function_call 项",
+      _text27 == "" and _fc27 and _fc27[0].get("name") == "terminal",
+      (_text27, _fc27))
+
+_src27 = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "qoder_proxy.py"), encoding="utf-8").read()
+check("写入侧只引用 LEAK_MARKER 常量（无重复字面量）",
+      _src27.count(json.dumps(P.LEAK_MARKER, ensure_ascii=False)) == 1
+      and "LEAK_MARKER + " in _src27,
+      _src27.count(json.dumps(P.LEAK_MARKER, ensure_ascii=False)))
+
+print()
+print("[27.5] issue #9：截断的 marker+JSON 回声必须吞掉、不得透传（P0）")
+_TRUNC27 = _M27 + "\n" + _CALLS27[:40]      # 未闭合字符串的截断回声（issue #9 样本形态）
+check("判据：截断数组 -> True",
+      P._leaked_partial_droppable(_TRUNC27, {"terminal"}) is True)
+check("判据：只有 marker -> True",
+      P._leaked_partial_droppable(_M27, {"terminal"}) is True)
+check("判据：围栏 + 截断数组 -> True",
+      P._leaked_partial_droppable("```json\n" + _TRUNC27, {"terminal"}) is True)
+check("判据：marker + 散文 -> False",
+      P._leaked_partial_droppable(_M27 + "\n这是一段解释文字。",
+                                 {"terminal"}) is False)
+check("判据：不以 marker 开头的讨论回复 -> False",
+      P._leaked_partial_droppable("网关会写入 " + _M27 + " 这样的提示。",
+                                 {"terminal"}) is False)
+check("判据：未声明 tools / 空 names -> False",
+      P._leaked_partial_droppable(_TRUNC27, None) is False
+      and P._leaked_partial_droppable(_TRUNC27, set()) is False)
+check("判据：完整但未声明工具名的数组 -> False（保持 fail-open 透传）",
+      P._leaked_partial_droppable(_LEAK27, {"other"}) is False)
+
+_frames_trunc = [json.loads(f[6:]) for f in P.recover_leaked_tool_calls(
+    iter([_raw27(_TRUNC27[:12]), _raw27(_TRUNC27[12:]), _raw27("", "stop")]),
+    {"terminal"})]
+_text_trunc = "".join(_f["choices"][0]["delta"].get("content") or ""
+                      for _f in _frames_trunc)
+check("流式：截断回声被吞（正文既无 marker、也无 terminal 明文）",
+      _text_trunc == ""
+      and P.LEAK_MARKER not in json.dumps(_frames_trunc, ensure_ascii=False),
+      _text_trunc)
+check("流式：吞掉后 finish_reason 仍为 stop（Lead 裁定）",
+      _frames_trunc[-1]["choices"][0]["finish_reason"] == "stop",
+      _frames_trunc)
+
+_obj_trunc = P.aggregate_stream(
+    _Resp27([_env27(_TRUNC27[:12]), _env27(_TRUNC27[12:]), _env27("", "stop")]),
+    "m27", None, allowed_names={"terminal"})
+_msg_trunc = _obj_trunc["choices"][0]["message"]
+check("非流式：截断回声 -> content 清空、无 tool_calls、finish=stop",
+      _msg_trunc.get("content") == "" and not _msg_trunc.get("tool_calls")
+      and _obj_trunc["choices"][0]["finish_reason"] == "stop", _obj_trunc)
+
+_ev_trunc = [f.decode() for f in P.stream_responses_events(
+    iter([_raw27(_TRUNC27[:12]), _raw27(_TRUNC27[12:]), _raw27("", "stop")]),
+    "m27", {"usage": None, "custom_names": set(),
+            "allowed_names": {"terminal"}})]
+_joined_trunc = "".join(_ev_trunc)
+_parsed_trunc_lk = [json.loads(_ln[6:]) for _fr in _ev_trunc
+                       for _ln in _fr.splitlines() if _ln.startswith("data: ")]
+_text_delta_trunc = "".join(e.get("delta") or "" for e in _parsed_trunc_lk
+                            if isinstance(e, dict)
+                            and e.get("type") == "response.output_text.delta")
+check("Responses 流式：截断回声不出现在正文增量里（不再用短词匹配整个事件流）",
+      _text_delta_trunc == "" and P.LEAK_MARKER not in _joined_trunc,
+      (_text_delta_trunc[:120], _joined_trunc[:120]))
+
+_frames_falsify = [json.loads(f[6:]) for f in P.recover_leaked_tool_calls(
+    iter([_raw27(_M27), _raw27("\n这是一段解释文字。"), _raw27("", "stop")]),
+    {"terminal"})]
+_text_falsify = "".join(_f["choices"][0]["delta"].get("content") or ""
+                        for _f in _frames_falsify)
+check("流式：证伪（marker 后接散文）-> 仍 fail-open 补发原文",
+      _M27 in _text_falsify and "解释文字" in _text_falsify, _text_falsify)
+
+print()
+print("[27.6] 写入侧暴露面削减（历史工具结果首尾保留 + 中间省略）")
+_LONG29 = "".join("log line %05d %s\n" % (i, "y" * 60) for i in range(150))
+_MSGS29 = [
+    {"role": "user", "content": "run"},
+    {"role": "tool", "name": "terminal", "content": _LONG29},   # 历史 -> 削
+    {"role": "user", "content": "again"},
+    {"role": "tool", "name": "terminal", "content": _LONG29},   # 当前轮 -> 不削
+    {"role": "tool", "name": "cat", "content": "ok: 3 passed"},
+]
+_flat29 = P.flatten_messages(_MSGS29)[1]
+_hist29, _cur29, _short29 = (_flat29[1]["content"], _flat29[3]["content"],
+                             _flat29[4]["content"])
+_PREF29 = P.TOOL_RESULT_MARKER + " (terminal)]\n"
+_body29 = _hist29.split("\n", 1)[1]     # 剥掉 "[工具结果 (terminal)]" 前缀行
+check("削减：历史工具结果被截断（首尾保留 + 省略标记）",
+      len(_hist29) < len(_LONG29) and "已省略" in _hist29
+      and _body29.startswith(_LONG29[:20]) and _body29.endswith(_LONG29[-40:]),
+      (len(_LONG29), len(_hist29)))
+check("削减：信封前缀逐字节不变（历史与当前轮都是）",
+      _hist29.startswith(_PREF29) and _cur29.startswith(_PREF29)
+      and _short29.startswith(P.TOOL_RESULT_MARKER + " (cat)]\n"))
+check("削减：当前轮的 tool 结果全文保留", _cur29 == _PREF29 + _LONG29)
+check("削减：短结果不动", _short29.endswith("ok: 3 passed"))
+check("削减：完整 JSON 不削且仍可解析",
+      isinstance(json.loads(P._shrink_tool_result(
+          json.dumps({"a": [1, 2, 3] * 20}), 2000)), dict))
+check("削减：无 user 的会话 -> 全部视为当前轮（不削）",
+      P.flatten_messages([{"role": "system", "content": "s"},
+                          {"role": "tool", "name": "t",
+                           "content": _LONG29}])[1][0]["content"]
+      == P.TOOL_RESULT_MARKER + " (t)]\n" + _LONG29)
+os.environ["QD_TOOL_RESULT_KEEP"] = "0"
+check("开关：QD_TOOL_RESULT_KEEP=0 完全回退旧行为（全文回灌）",
+      P.flatten_messages(_MSGS29)[1][1]["content"] == _PREF29 + _LONG29)
+os.environ["QD_TOOL_RESULT_KEEP"] = "off"
+check("开关：off -> 关闭", P._tool_result_keep_chars() == 0)
+os.environ["QD_TOOL_RESULT_KEEP"] = "abc"
+check("开关：非法值回落默认", P._tool_result_keep_chars() == 2000)
+del os.environ["QD_TOOL_RESULT_KEEP"]
+check("开关：默认值 = 2000（保守）",
+      P._tool_result_keep_chars() == P.TOOL_RESULT_KEEP_DEFAULT == 2000)
+
+print()
+print("[27.7] 结构化工具历史直传（task-32：provider 白名单 + 一键回退）")
+_SMSGS32 = [
+    {"role": "user", "content": "weather?"},
+    {"role": "assistant", "content": None, "tool_calls": [
+        {"id": "call_1", "type": "function",
+         "function": {"name": "get_weather", "arguments": {"city": "SZ"}}}]},
+    {"role": "tool", "tool_call_id": "call_1", "name": "get_weather",
+     "content": "25C"},
+    {"role": "user", "content": "thanks"},
+    {"role": "assistant", "content": "", "tool_calls": [
+        {"id": "call_2", "type": "function",
+         "function": {"name": "get_weather",
+                      "arguments": "{\"city\": \"BJ\"}"}}]},
+    {"role": "tool", "tool_call_id": "call_2", "name": "get_weather",
+     "content": "18C"},
+]
+_flat32s = P.flatten_messages(_SMSGS32, structured=True)[1]
+_flat32t = P.flatten_messages(_SMSGS32, structured=False)[1]
+os.environ.pop("QD_STRUCTURED_TOOL_HISTORY", None)
+check("开关：auto + CN + Qwen -> 结构化",
+      P.structured_tool_history_enabled(model="qwen3.8-flash",
+                                        model_key="qwen3.8-flash",
+                                        realm="cn", messages=_SMSGS32) is True)
+check("开关：auto + CN + GLM（上游 key gm5x）-> 结构化",
+      P.structured_tool_history_enabled(model="glm-5.3-flash",
+                                        model_key="gm53flash",
+                                        realm="cn", messages=_SMSGS32) is True)
+check("开关：auto + CN + DeepSeek -> 文本化（未验证 provider 默认不启用）",
+      P.structured_tool_history_enabled(model="deepseek-flash",
+                                        model_key="deepseek-flash",
+                                        realm="cn", messages=_SMSGS32) is False)
+check("开关：auto + INTL -> 文本化（INTL legacy 未实测）",
+      P.structured_tool_history_enabled(model="qwen3.8-flash",
+                                        model_key="qwen3.8-flash",
+                                        realm="intl", messages=_SMSGS32)
+      is False)
+os.environ["QD_STRUCTURED_TOOL_HISTORY"] = "on"
+check("开关：on 强制（DeepSeek / INTL 也走结构化，供补验证）",
+      P.structured_tool_history_enabled(model="deepseek-flash",
+                                        model_key="deepseek-flash",
+                                        realm="intl", messages=_SMSGS32) is True)
+check("守卫：缺 tool_call_id -> 一律回退文本化（fail-safe）",
+      P.structured_tool_history_enabled(
+          model="qwen", model_key="qwen", realm="cn",
+          messages=[{"role": "user", "content": "x"},
+                    {"role": "tool", "content": "y"}]) is False)
+os.environ["QD_STRUCTURED_TOOL_HISTORY"] = "off"
+check("开关：off 一键回退（即使 Qwen）",
+      P.structured_tool_history_enabled(model="qwen3.8-flash",
+                                        model_key="qwen3.8-flash",
+                                        realm="cn", messages=_SMSGS32) is False)
+del os.environ["QD_STRUCTURED_TOOL_HISTORY"]
+check("产物：tool 消息保留 role/tool_call_id，content 是非 null 字符串",
+      _flat32s[2] == {"role": "tool", "tool_call_id": "call_1",
+                      "content": "25C"} and _flat32s[5]["role"] == "tool")
+check("产物：assistant.content 为 \"\"（绝不为 null）+ tool_calls 结构齐备",
+      _flat32s[1]["content"] == "" and _flat32s[1]["content"] is not None
+      and _flat32s[1]["tool_calls"][0]["id"] == "call_1"
+      and _flat32s[1]["tool_calls"][0]["type"] == "function"
+      and _flat32s[1]["tool_calls"][0]["function"]["name"] == "get_weather")
+check("产物：arguments 的 dict 形态被归一为 JSON 字符串",
+      _flat32s[1]["tool_calls"][0]["function"]["arguments"] == '{"city": "SZ"}')
+check("产物：结构化模式下不存在 null content",
+      all(m.get("content") is not None for m in _flat32s))
+check("产物：当前轮（末尾 tool）同样走结构化，不与文本混用",
+      _flat32s[5] == {"role": "tool", "tool_call_id": "call_2",
+                      "content": "18C"})
+check("对照：文本化模式仍是 user 降级 + LEAK_MARKER，且无 tool 角色",
+      [m["role"] for m in _flat32t] == ["user", "assistant", "user", "user",
+                                        "assistant", "user"]
+      and _flat32t[1]["content"].endswith("]")
+      and P.TOOL_RESULT_MARKER in _flat32t[2]["content"])
+
+print()
+print("[27.8] 内层错误可观测性（HTTP 200 信封里藏 error）")
+_ERR34 = json.dumps({
+    "error": {"type": "invalid_request_error", "code": "invalid_request_error",
+              "message": "Messages with role 'tool' must be a response to a "
+                         "preceding message with 'tool_calls'"}})
+_ENV34 = ("data: " + json.dumps({"statusCodeValue": 200, "body": _ERR34},
+                                ensure_ascii=False) + "\n\n").encode("utf-8")
+_s0_34 = P.inner_error_snapshot()
+_lines34 = list(P.iter_inner_sse([_ENV34]))
+_s1_34 = P.inner_error_snapshot()
+check("内层 error：被识别并计数；chunk 仍照常透传（行为不变）",
+      _s1_34["total"] == _s0_34["total"] + 1
+      and _s1_34["kinds"].get("invalid_request", 0) >= 1
+      and len(_lines34) == 1)
+check("内层 error：同类重复计数累加、只按类别告警一次",
+      P.note_inner_upstream_error({"error": {"type": "provider_error",
+                                              "message": "provider_error"}},
+                                  status=200) == "invalid_request"
+      and P.note_inner_upstream_error(
+          {"error": {"message": "invalid_request again"}}, status=200)
+      == "invalid_request"
+      and P.inner_error_snapshot()["total"] == _s1_34["total"] + 2
+      and P.inner_error_snapshot()["warned"].count("invalid_request") == 1)
+check("内层 error：正常 chunk 不误判",
+      P.note_inner_upstream_error({"choices": [{"delta": {"content": "hi"}}]})
+      == "" and P.note_inner_upstream_error(None) == ""
+      and P.note_inner_upstream_error({"usage": {"total_tokens": 3}}) == "")
+check("内层 error：分类覆盖 content_policy / rate_limit",
+      P._inner_error_kind("DataInspectionFailed", "inappropriate content")
+      == "content_policy"
+      and P._inner_error_kind("", "usage exceeds frequency limit 10605")
+      == "rate_limit")
+check("内层 error：计数挂到运行信息（/usage/perf 返回含 inner_errors）",
+      "inner_errors" in P._perf_stats_uncached(sample=1)
+      and isinstance(P.inner_error_snapshot(), dict))
+
+
+def _raise34():
+    try:
+        list(P.iter_inner_sse([("data: " + json.dumps(
+            {"statusCodeValue": 418, "body": "boom"}) + "\n\n").encode("utf-8")]))
+        return "no-raise"
+    except P.UpstreamStatus as exc:
+        return "raised:%s" % exc.status
+
+
+check("形态区分：信封非 200 仍抛 UpstreamStatus（既有路径未变）",
+      _raise34() == "raised:418")
+
+print()
+print("[27.9] issue #16：散文+marker 同帧 / 未完成 \\uXXXX 转义（回读守卫边界）")
+_M16 = P.LEAK_MARKER
+_N16 = {"terminal"}
+_A16 = _M16 + "\n" + '[{"name": "terminal", "arguments": "{\\"cmd\\": \\"ls'
+_B116 = "我先看看目录结构。\n\n" + _A16
+_B316 = _M16 + "\n" + '[{"name": "terminal", "arguments": "{\\"cmd\\": \\"echo \\u63a'
+_C16 = "[工具结果]\n{\"output\": \"ok\"}\n[工具结果结束]"
+
+
+def _txt16(out):
+    return "".join(f["choices"][0]["delta"].get("content") or "" for f in out)
+
+
+_r16a = [json.loads(f[6:]) for f in P.recover_leaked_tool_calls(
+    iter([_raw27(_A16[:10]), _raw27(_A16[10:]), _raw27("", "stop")]), _N16)]
+check("A 参照（marker 开头 + 截断）-> 仍吞（回归）",
+      P.LEAK_MARKER not in _txt16(_r16a))
+_r16b1 = [json.loads(f[6:]) for f in P.recover_leaked_tool_calls(
+    iter([_raw27(_B116), _raw27("", "stop")]), _N16)]
+check("B1 散文 + marker 同帧 -> 吞回声块、散文保留",
+      P.LEAK_MARKER not in _txt16(_r16b1)
+      and "我先看看目录结构。" in _txt16(_r16b1))
+_r16b2 = [json.loads(f[6:]) for f in P.recover_leaked_tool_calls(
+    iter([_raw27("我先看看目录结构。\n\n"), _raw27(_A16), _raw27("", "stop")]),
+    _N16)]
+check("B2 散文与 marker 分帧 -> 同样吞（回归）",
+      P.LEAK_MARKER not in _txt16(_r16b2)
+      and "我先看看目录结构。" in _txt16(_r16b2))
+_r16b3 = [json.loads(f[6:]) for f in P.recover_leaked_tool_calls(
+    iter([_raw27(_B316[:12]), _raw27(_B316[12:]), _raw27("", "stop")]), _N16)]
+check("B3 截断落在未写完的 \\uXXXX 转义 -> 吞",
+      P.LEAK_MARKER not in _txt16(_r16b3))
+_r16c = [json.loads(f[6:]) for f in P.recover_leaked_tool_calls(
+    iter([_raw27(_C16), _raw27("", "stop")]), _N16)]
+check("C [工具结果] 回声（回归）-> 吞", "[工具结果" not in _txt16(_r16c))
+check("B3 判据单元：未完成 / 彻底非法转义都视为可继续扩展",
+      P._json_array_prefix_ok('[{"a": "x\\u63a') is True
+      and P._json_array_prefix_ok('[{"a": "x\\uZZZZ') is True
+      and P._json_array_prefix_ok('[{"a": "x\\u63a2') is True)
+_r16e1 = [json.loads(f[6:]) for f in P.recover_leaked_tool_calls(
+    iter([_raw27("列表项 [1, 2"), _raw27(", 3] 结束"), _raw27("", "stop")]),
+    _N16)]
+check("误伤边界：普通文本（含 [1, 2）原样透传",
+      _txt16(_r16e1) == "列表项 [1, 2, 3] 结束")
+_r16e2 = [json.loads(f[6:]) for f in P.recover_leaked_tool_calls(
+    iter([_raw27("看这个 [assis"), _raw27("tant 是普通词"),
+          _raw27("", "stop")]), _N16)]
+check("误伤边界：帧尾 marker 真前缀（[assis）证伪后完整补发",
+      _txt16(_r16e2) == "看这个 [assistant 是普通词")
+_r16e4 = [json.loads(f[6:]) for f in P.recover_leaked_tool_calls(
+    iter([_raw27("散文 " + _M16 + "\n"
+                + '[{"name": "terminal", "arguments": "{}"}]'),
+          _raw27("", "stop")]), _N16)]
+check("散文 + 完整合法数组 -> 仍走恢复路径（tool_calls），散文保留",
+      bool([f for f in _r16e4 if f["choices"][0]["delta"].get("tool_calls")])
+      and _txt16(_r16e4).startswith("散文"))
+check("窗口常量：_MARKER_HOLD_WINDOW = 最长标记 - 1（17）",
+      P._MARKER_HOLD_WINDOW == len(P.LEAK_MARKER) - 1 == 17)
+_obj16 = P.aggregate_stream(
+    _Resp27([_env27(_B116[:12]), _env27(_B116[12:]), _env27("", "stop")]),
+    "m27", None, allowed_names=_N16)
+check("非流式：散文 + marker 回声块 -> 只吞块、散文保留",
+      _obj16["choices"][0]["message"].get("content") == "我先看看目录结构。\n\n")
+_ev16 = [f.decode() for f in P.stream_responses_events(
+    iter([_raw27(_B116[:12]), _raw27(_B116[12:]), _raw27("", "stop")]), "m27",
+    {"usage": None, "custom_names": set(), "allowed_names": _N16})]
+check("Responses 流式：散文 + marker 同帧 -> 不回显 marker、散文保留",
+      P.LEAK_MARKER not in "".join(_ev16)
+      and "我先看看目录结构。" in "".join(_ev16))
+
+print()
+print("[27.95] issue #16 兜底：hold 缓冲上限（超限 fail-open 放行）")
+_BIG16 = P.LEAK_MARKER + "\n[" + "1," * 20000          # 约 40KB 的候选前缀
+_big_out = [json.loads(f[6:]) for f in P.recover_leaked_tool_calls(
+    iter([_raw27(_BIG16), _raw27("2]", "stop")]), {"terminal"})]
+_big_text = "".join(f["choices"][0]["delta"].get("content") or ""
+                    for f in _big_out)
+check("超限：hold 超过 _HOLD_MAX_CHARS -> fail-open 放行且内容只出现一次",
+      len(_BIG16) > P._HOLD_MAX_CHARS and _big_text == _BIG16 + "2]")
+check("上限常量：32KB / 200 帧",
+      P._HOLD_MAX_CHARS == 32768 and P._HOLD_MAX_FRAMES == 200)
+_keep_frames16 = P._HOLD_MAX_FRAMES
+try:
+    P._HOLD_MAX_FRAMES = 2
+    _fr16 = [json.loads(f[6:]) for f in P.recover_leaked_tool_calls(
+        iter([_raw27(P.LEAK_MARKER), _raw27("\n["), _raw27("1"), _raw27("2"),
+              _raw27("", "stop")]), {"terminal"})]
+finally:
+    P._HOLD_MAX_FRAMES = _keep_frames16
+check("帧数兜底：超过 _HOLD_MAX_FRAMES 帧仍未证伪 -> 放行",
+      "".join(f["choices"][0]["delta"].get("content") or "" for f in _fr16)
+      == P.LEAK_MARKER + "\n[12")
+
+print()
+print("[28] 发布前补强：终局验证 §10.7#5 的零覆盖项（防止静默回归）")
+import ast as _ast28
+import re as _re28
+import shutil as _sh28
+import tempfile as _tf28
+import time as _t28
+import qoder_scheduler as _S28
+
+_src28 = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "qoder_proxy.py"), encoding="utf-8").read()
+
+
+def _arg_src28(src_text, func_name):
+    """AST 级提取：func_name(...) 每个调用的位置参数源码片段（离线可变异的判据）。"""
+    tree = _ast28.parse(src_text)
+    out = []
+    for node in _ast28.walk(tree):
+        if isinstance(node, _ast28.Call) and isinstance(node.func, _ast28.Name) \
+                and node.func.id == func_name:
+            out.append([_ast28.get_source_segment(src_text, a) for a in node.args])
+    return out
+
+
+# --- 28.1 Responses 重试上下文：两处重开必须用转换后的 chat_req ---
+_i0_28 = _src28.index("chat_req = responses_to_chat(payload)")
+_i1_28 = _src28.index("\n    def ", _i0_28 + 10)
+_resp_block28 = _src28[_i0_28:_i1_28]
+check("Responses 重开：两处重试都以 chat_req 发起"
+      "（open_upstream 与 aggregate_with_envelope_retry）",
+      "chat_req, session_key=session_key" in _resp_block28
+      and "upstream, chat_req, session_key" in _resp_block28)
+_strip28 = _resp_block28.replace("chat_req = responses_to_chat(payload)", "")
+_idents28 = _re28.findall(r"(?<![\w.])payload(?![\w])", _strip28)
+_gets28 = len(_re28.findall(r"payload\.get\(", _strip28))
+check("Responses 分支：原始 payload 只用于读字段（payload.get），不再作为上游请求体"
+      "——回退成 payload 即红",
+      len(_idents28) == _gets28 and _gets28 >= 1,
+      (_idents28, _gets28))
+_agg_args28 = _arg_src28(_src28, "aggregate_with_envelope_retry")
+check("AST：aggregate_with_envelope_retry 实参里 chat_req（Responses）与 payload"
+      "（chat）各司其职——单一断言同时锁住两条链路",
+      any(len(a) > 1 and a[1] == "chat_req" for a in _agg_args28)
+      and any(len(a) > 1 and a[1] == "payload" for a in _agg_args28),
+      [a[:2] for a in _agg_args28])
+
+# --- 28.2 response.failed 终态事件与 sequence_number 续号 ---
+_h28 = {"usage": None, "custom_names": set(), "allowed_names": {"terminal"}}
+_ev28 = [json.loads(_ln[6:])
+         for _f in P.stream_responses_events(
+             iter([_raw27("hi"), _raw27("", "stop")]), "m27", _h28)
+         for _ln in _f.decode().splitlines() if _ln.startswith("data: ")]
+_max28 = max(e["sequence_number"] for e in _ev28)
+_fail_raw28 = P._responses_failed_frame(_h28, 418, "upstream boom")
+_fail_obj28 = json.loads([_l for _l in _fail_raw28.decode().splitlines()
+                          if _l.startswith("data: ")][0][6:])
+check("response.failed：终态事件名 / status / error.code 正确",
+      _fail_raw28.decode("utf-8").startswith("event: response.failed\n")
+      and _fail_obj28["type"] == "response.failed"
+      and _fail_obj28["response"]["status"] == "failed"
+      and _fail_obj28["response"]["error"]["code"] == "418",
+      _fail_obj28)
+check("response.failed：sequence_number 严格大于此前所有事件（续号，不回退到 0）",
+      _fail_obj28["sequence_number"] > _max28,
+      (_fail_obj28["sequence_number"], _max28))
+_h28b = {"usage": None, "custom_names": set(), "allowed_names": {"terminal"}}
+_ev28b1 = [json.loads(_ln[6:])
+           for _f in P.stream_responses_events(
+               iter([_raw27("a"), _raw27("", "stop")]), "m27", _h28b)
+           for _ln in _f.decode().splitlines() if _ln.startswith("data: ")]
+_ev28b2 = [json.loads(_ln[6:])
+           for _f in P.stream_responses_events(
+               iter([_raw27("b"), _raw27("", "stop")]), "m27", _h28b)
+           for _ln in _f.decode().splitlines() if _ln.startswith("data: ")]
+check("Responses 重开后 sequence_number 续号（第二条流从第一条流的 max+1 开始）",
+      min(e["sequence_number"] for e in _ev28b2)
+      == max(e["sequence_number"] for e in _ev28b1) + 1,
+      (max(e["sequence_number"] for e in _ev28b1),
+       min(e["sequence_number"] for e in _ev28b2)))
+
+# --- 28.3 catalog_source 只读来源标注 ---
+_SRC_SET28 = ("external-json", "embedded-frozen", "unknown")
+check("catalog_source：snapshot_source() 取值在允许集合内，未知 realm 走 cn 分支",
+      C.snapshot_source("cn") in _SRC_SET28
+      and C.snapshot_source("intl") in _SRC_SET28
+      and C.snapshot_source("bogus-realm") == C.snapshot_source("cn"),
+      (C.snapshot_source("cn"), C.snapshot_source("intl")))
+check("catalog_source：/v1/models 既有字段未变、新增来源标注（含异常兜底 unknown）",
+      '"object": "list", "data": data' in _src28
+      and '"catalog_source": catalog_source' in _src28
+      and 'catalog_source = "unknown"' in _src28,
+      [_l.strip() for _l in _src28.splitlines() if "catalog_source" in _l][:4])
+
+# --- 28.4 Scheduler：状态落盘子目录 + 启动补签闸门（mark-before-act） ---
+_tmp28 = _tf28.mkdtemp(prefix="qd-test-sched-")
+_sched_err28 = None
+try:
+    _pool28 = A.AccountPool(_tmp28)
+    _s1_28 = _S28.Scheduler(_pool28, state_dir=_tmp28)
+    _gate_first28 = _s1_28._allow_complement_checkin(_S28.CYCLE_STARTUP)
+    _state_path28 = _s1_28._state_path()
+    _state_exists28 = os.path.isfile(_state_path28)
+    with open(_state_path28, encoding="utf-8") as _fh28:
+        _state_json28 = json.load(_fh28)
+    _gate_second28 = _s1_28._allow_complement_checkin(_S28.CYCLE_STARTUP)
+    _s2_28 = _S28.Scheduler(_pool28, state_dir=_tmp28)     # 模拟进程重启
+    _gate_restart28 = _s2_28._allow_complement_checkin(_S28.CYCLE_STARTUP)
+    _gate_hour28 = _s2_28._allow_complement_checkin(_S28.CYCLE_HOUR)
+    _accounts28 = _pool28.load()
+except Exception as _exc28:
+    _sched_err28 = _exc28
+    _state_path28 = ""
+    _state_exists28 = False
+    _state_json28 = {}
+    _gate_first28 = _gate_second28 = _gate_restart28 = _gate_hour28 = None
+    _accounts28 = []
+finally:
+    _sh28.rmtree(_tmp28, ignore_errors=True)
+
+check("Scheduler：state.json 落在账号目录的子目录，且不会被 AccountPool.load 当成账号",
+      _sched_err28 is None
+      and _state_path28 == os.path.join(_tmp28, "scheduler", "state.json")
+      and _state_exists28 and _accounts28 == [],
+      (_sched_err28, _state_path28, len(_accounts28)))
+check("Scheduler：mark-before-act——首次启动补签返回 True，且当日标记已先落盘",
+      _gate_first28 is True
+      and _state_json28.get("startup_claim_date") == _t28.strftime("%Y-%m-%d"),
+      _state_json28.get("startup_claim_date"))
+check("Scheduler：同一天第二次启动补签被闸门拒绝（False）",
+      _gate_second28 is False, _gate_second28)
+check("Scheduler：进程重启后不重放（新实例读同一 state.json 仍为 False）",
+      _gate_restart28 is False, _gate_restart28)
+check("Scheduler：整点巡回来由不受启动闸门限制（True）",
+      _gate_hour28 is True, _gate_hour28)
+
+# --- 28.5 身份来源口径（Lead 裁决：合法值只有 runtime-info / derived） ---
+_acc_src28 = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "qoder_accounts.py"), encoding="utf-8").read()
+_acc_code28 = "\n".join(_l for _l in _acc_src28.splitlines()
+                          if not _l.lstrip().startswith("#"))
+check("身份来源口径：自愈条件用真实取值 runtime-info，代码里不得再有 == \"native\" 死逻辑"
+      "（注释里的历史说明不算）",
+      '"runtime-info"' in _acc_code28 and '== "native"' not in _acc_code28,
+      [_l.strip() for _l in _acc_code28.splitlines() if '== "native"' in _l][:2])
+print()
+print("[29] issue #10 三态可观测性：实际发送行为（native/omitted）+ INTL 已知限制提示")
+_MH29 = ("cosy-machineid", "cosy-machinetoken", "cosy-machinetype",
+         "cosy-machineos", "cosy-machinehostname", "cosy-machinecode")
+_orig_nmi29 = A.native_machine_identity
+_orig_cget29 = A.Account._campaigns_get
+
+
+def _camp29(realm, native):
+    """构造账号：返回 (account, desktop_headers 结果, 机器头状态, campaigns() 结果)。
+
+    native=True 打桩原生桥返回带 machineToken 的真身份；native=False 返回空 dict
+    （= 无原生桥，issue #10 的 derived 场景）。
+    """
+    if native:
+        A.native_machine_identity = lambda r, u, force=False: {
+            "machineToken": "tok29", "machineType": "3", "machineCode": "c29",
+            "source": A.MACHINE_IDENTITY_NATIVE}
+    else:
+        A.native_machine_identity = lambda r, u, force=False: {}
+    acc29 = A.Account({"uid": "u29-%s-%s" % (realm, "n" if native else "d"),
+                       "realm": realm, "accessToken": "dt-x"})
+    hdrs29 = acc29.desktop_headers()
+    state29 = acc29.machine_headers_state
+    A.Account._campaigns_get = lambda self: (
+        {"campaigns": [], "showCampaign": True, "claimable": False}, 200, "")
+    try:
+        st29 = acc29.campaigns(force=True)
+    finally:
+        A.Account._campaigns_get = _orig_cget29
+    return hdrs29, state29, st29
+
+
+try:
+    _h_cn_n29, _s_cn_n29, _c_cn_n29 = _camp29("cn", True)
+    _h_cn_d29, _s_cn_d29, _c_cn_d29 = _camp29("cn", False)
+    _h_in_n29, _s_in_n29, _c_in_n29 = _camp29("intl", True)
+    _h_in_d29, _s_in_d29, _c_in_d29 = _camp29("intl", False)
+    A.Account._campaigns_get = lambda self: (None, 500, "boom29")
+    _acc_fail29 = A.Account({"uid": "u29fail", "realm": "cn", "accessToken": "dt-x"})
+    _st_fail29 = _acc_fail29.campaigns(force=True)
+finally:
+    A.native_machine_identity = _orig_nmi29
+    A.Account._campaigns_get = _orig_cget29
+
+check("三态 cn×native：真发六头 + desktop_headers 与 campaigns() 都报 native",
+      all(_h_cn_n29.get(k) for k in _MH29)
+      and _s_cn_n29 == A.MACHINE_HEADERS_NATIVE
+      and _c_cn_n29.get("machine_headers") == A.MACHINE_HEADERS_NATIVE,
+      (_s_cn_n29, _c_cn_n29.get("machine_headers")))
+check("三态 cn×derived：一个机器头都不发 + 状态 omitted",
+      not any(_h_cn_d29.get(k) for k in _MH29)
+      and _s_cn_d29 == A.MACHINE_HEADERS_OMITTED
+      and _c_cn_d29.get("machine_headers") == A.MACHINE_HEADERS_OMITTED,
+      (_s_cn_d29, _c_cn_d29.get("machine_headers")))
+check("三态 intl×native：真发六头 + 状态 native",
+      all(_h_in_n29.get(k) for k in _MH29)
+      and _s_in_n29 == A.MACHINE_HEADERS_NATIVE
+      and _c_in_n29.get("machine_headers") == A.MACHINE_HEADERS_NATIVE,
+      (_s_in_n29, _c_in_n29.get("machine_headers")))
+check("三态 intl×derived：一个机器头都不发 + 状态 omitted",
+      not any(_h_in_d29.get(k) for k in _MH29)
+      and _s_in_d29 == A.MACHINE_HEADERS_OMITTED
+      and _c_in_d29.get("machine_headers") == A.MACHINE_HEADERS_OMITTED,
+      (_s_in_d29, _c_in_d29.get("machine_headers")))
+check("INTL×omitted 必须带已知限制提示（非空字符串，含 UMID 与「已知限制」措辞）",
+      isinstance(_c_in_d29.get("hint"), str)
+      and "UMID" in _c_in_d29["hint"] and "已知限制" in _c_in_d29["hint"],
+      _c_in_d29.get("hint"))
+check("CN×omitted 的 hint 键存在且为空串（限制提示不得扩散到国内版）",
+      "hint" in _c_cn_d29 and _c_cn_d29.get("hint") == "",
+      _c_cn_d29.get("hint"))
+check("native（两个区域）的 hint 均为空串：只有 INTL×omitted 才提示",
+      _c_cn_n29.get("hint") == "" and _c_in_n29.get("hint") == "",
+      (_c_cn_n29.get("hint"), _c_in_n29.get("hint")))
+check("两个维度正交：derived 身份与 omitted 机器头可同时成立"
+      "（identity 不再被当作「能不能发头」的信号）",
+      _c_cn_d29.get("identity") == "derived"
+      and _c_cn_d29.get("machine_headers") == A.MACHINE_HEADERS_OMITTED,
+      (_c_cn_d29.get("identity"), _c_cn_d29.get("machine_headers")))
+print()
+print("[30] UMID 提取器（_install_umid.py）离线纯函数断言：识别 / 平台选择 / 扫描 / 校验 / 幂等")
+import base64 as _b64_30
+import contextlib as _cl_30
+import io as _io_30
+import shutil as _sh_30
+import struct as _st_30
+import tarfile as _tfmod_30
+import tempfile as _tf_30
+import _install_umid as U30
+
+
+def _elf30(machine, cls=2, endian=1):
+    buf = bytearray(0x40)
+    buf[0:4] = b"\x7fELF"
+    buf[4] = cls
+    buf[5] = endian
+    buf[18:20] = _st_30.pack("<H", machine)
+    return bytes(buf)
+
+
+def _macho30(cpu):
+    return b"\xcf\xfa\xed\xfe" + _st_30.pack("<I", cpu) + b"\x00" * 8
+
+
+def _pe30(machine):
+    buf = bytearray(0x80)
+    buf[0:2] = b"MZ"
+    buf[0x3C:0x40] = _st_30.pack("<I", 0x40)
+    buf[0x40:0x44] = b"PE\x00\x00"
+    buf[0x44:0x46] = _st_30.pack("<H", machine)
+    return bytes(buf)
+
+
+_WASM30 = b"\x00asm\x01\x00\x00\x00"
+_ELF_X30 = _elf30(0x3E)
+_ELF_A30 = _elf30(0xB7)
+
+# --- 30.1 魔数/架构识别 ---
+check("identify_blob：ELF x86-64 / aarch64 正确（e_machine 区分）",
+      U30.identify_blob(_ELF_X30) == "elf-x86_64"
+      and U30.identify_blob(_ELF_A30) == "elf-aarch64",
+      (U30.identify_blob(_ELF_X30), U30.identify_blob(_ELF_A30)))
+check("identify_blob：Mach-O x86_64 / arm64 正确（cputype 区分）",
+      U30.identify_blob(_macho30(0x01000007)) == "macho-x86_64"
+      and U30.identify_blob(_macho30(0x0100000C)) == "macho-arm64"
+      and U30.identify_blob(_macho30(0x7)) == "unknown",
+      (U30.identify_blob(_macho30(0x01000007)), U30.identify_blob(_macho30(0x0100000C))))
+check("identify_blob：PE x86_64 / aarch64 正确（e_lfanew -> PE\\0\\0 -> machine）",
+      U30.identify_blob(_pe30(0x8664)) == "pe-x86_64"
+      and U30.identify_blob(_pe30(0xAA64)) == "pe-aarch64",
+      (U30.identify_blob(_pe30(0x8664)), U30.identify_blob(_pe30(0xAA64))))
+check("identify_blob：截断/畸形 PE 不崩溃且归为 unknown（e_lfanew 越界有兜底）",
+      U30.identify_blob(b"MZ") == "unknown"
+      and U30.identify_blob(b"MZ" + b"\x00" * 0x3E) == "unknown"
+      and U30.identify_blob(_pe30(0x8664)[:0x44] + b"\x00" * 0x40) == "unknown",
+      (U30.identify_blob(b"MZ"), U30.identify_blob(b"MZ" + b"\x00" * 0x3E)))
+check("identify_blob：WASM 正确；非原生数据一律 unknown（空/垃圾/短 ELF/未知 e_machine/大端 ELF）",
+      U30.identify_blob(_WASM30) == "wasm"
+      and U30.identify_blob(b"") == "unknown"
+      and U30.identify_blob(b"\x00" * 64) == "unknown"
+      and U30.identify_blob(b"\x7fELF\x02\x01") == "unknown"
+      and U30.identify_blob(_elf30(0x28)) == "unknown"
+      and U30.identify_blob(_elf30(0x3E, endian=2)) == "unknown",
+      (U30.identify_blob(_WASM30), U30.identify_blob(b""), U30.identify_blob(_elf30(0x3E, endian=2))))
+
+# --- 30.2 平台 / 架构选择 ---
+check("component_for_platform：linux/darwin × x86_64/arm64 映射正确（含 AMD64/aarch64 别名）",
+      U30.component_for_platform("linux", "x86_64") == "elf-x86_64"
+      and U30.component_for_platform("linux", "AMD64") == "elf-x86_64"
+      and U30.component_for_platform("linux", "aarch64") == "elf-aarch64"
+      and U30.component_for_platform("linux", "arm64") == "elf-aarch64"
+      and U30.component_for_platform("darwin", "x86_64") == "macho-x86_64"
+      and U30.component_for_platform("darwin", "arm64") == "macho-arm64",
+      (U30.component_for_platform("linux", "AMD64"),
+       U30.component_for_platform("darwin", "arm64")))
+check("component_for_platform：win32 与未知组合返回 None（不猜平台）",
+      U30.component_for_platform("win32", "x86_64") is None
+      and U30.component_for_platform("linux", "riscv64") is None
+      and U30.component_for_platform("plan9", "x86_64") is None,
+      (U30.component_for_platform("win32", "x86_64"),
+       U30.component_for_platform("linux", "riscv64")))
+_cands30 = [(0, 0, _WASM30 + b"\x00" * 32), (0, 0, _ELF_A30), (0, 0, _ELF_X30),
+            (0, 0, _pe30(0x8664))]
+_pick_a30 = U30.select_candidate(_cands30, "elf-aarch64")
+_pick_x30 = U30.select_candidate(_cands30, "elf-x86_64")
+check("select_candidate：按期望标签精确挑（aarch64 不会挑到 x86-64 blob，反之亦然）",
+      _pick_a30 is not None and _pick_a30[0] == 1
+      and U30.identify_blob(_pick_a30[1]) == "elf-aarch64"
+      and _pick_x30 is not None and _pick_x30[0] == 2
+      and U30.identify_blob(_pick_x30[1]) == "elf-x86_64",
+      (_pick_a30[0] if _pick_a30 else None, _pick_x30[0] if _pick_x30 else None))
+check("select_candidate：无匹配返回 None（不会退而求其次给出错组件）",
+      U30.select_candidate([(0, 0, _WASM30), (0, 0, _pe30(0x8664))], "macho-arm64") is None)
+_pe_big30 = _pe30(0x8664) + b"\x00" * (3 * 1024 * 1024)      # ~3MB：超出真组件体积区间
+_pe_ok30 = _pe30(0x8664) + b"\x00" * (600 * 1024)            # ~600KB：落在 400KB–2MB
+_sel_pe30 = U30.select_candidate([(0, 0, _pe_big30), (0, 0, _pe_ok30)], "pe-x86_64")
+check("体积启发式：同格式多候选取落在 400KB–2MB 真组件区间的那个"
+      "（避开 docstring 记录的 7.3MB 疑似模块）",
+      _sel_pe30 is not None and _sel_pe30[0] == 1
+      and len(_sel_pe30[1]) == len(_pe_ok30),
+      (_sel_pe30[0] if _sel_pe30 else None,
+       len(_sel_pe30[1]) if _sel_pe30 else None))
+
+# --- 30.3 base64 扫描 ---
+# 扫描断言必须用"长度达标"的样本：base64(64B) 只有 88 字符，远小于 BLOB_MIN_LEN，
+# 因此这里把 ELF 头补零到 4KB+（头部魔数与 e_machine 不变，仍是合法 elf-x86_64）。
+_ELF_BIG30 = _ELF_X30 + b"\x00" * 4096
+_b64s30 = _b64_30.b64encode(_ELF_BIG30).decode()
+assert len(_b64s30) > U30.BLOB_MIN_LEN, len(_b64s30)
+_TICK30 = chr(96)
+_text30 = ('const a = "' + _b64s30 + '";\n'
+           'const short = "AAAA";\n'
+           "const b = '" + _b64s30 + "';\n"
+           "const c = " + _TICK30 + _b64s30 + _TICK30 + ";\n")
+_cands30b = U30.scan_bundle_candidates(_text30)
+check("scan_bundle_candidates：只收长度达标的引号字面量（短字面量与反引号模板都不收）",
+      len(_cands30b) == 2, [len(c[2]) for c in _cands30b])
+check("scan_bundle_candidates：偏移是内容区间（不含引号）且解码正确",
+      _text30[_cands30b[0][0]:_cands30b[0][1]] == _b64s30
+      and U30.identify_blob(_cands30b[0][2]) == "elf-x86_64",
+      (_cands30b[0][0], _cands30b[0][1]))
+check("scan_bundle_candidates：min_len 阈值可调（阈值高于字面量长度 -> 零候选）",
+      U30.scan_bundle_candidates(_text30, min_len=len(_b64s30) + 1) == []
+      and len(U30.scan_bundle_candidates(_text30, min_len=len(_b64s30))) == 2)
+check("扫描+选择：WASM 排在前面也不会被选中（按格式过滤，不按出现顺序）",
+      (lambda _s: _s is not None and _s[0] == 1)(U30.select_candidate(
+          [(0, 0, _WASM30 + b"\x00" * 64), (0, 0, _ELF_X30)], "elf-x86_64")))
+
+# --- 30.4 校验 ---
+check("verify_component：magic 与架构级双重校验（不匹配一律 False）",
+      U30.verify_component(_ELF_X30, "elf-x86_64") is True
+      and U30.verify_component(_ELF_X30, "elf-aarch64") is False
+      and U30.verify_component(_ELF_A30, "elf-x86_64") is False
+      and U30.verify_component(_WASM30, "elf-x86_64") is False
+      and U30.verify_component(b"", "elf-x86_64") is False,
+      (U30.verify_component(_ELF_X30, "elf-aarch64"),
+       U30.verify_component(_WASM30, "elf-x86_64")))
+_good30 = "sha512-" + _b64_30.b64encode(hashlib.sha512(b"abc").digest()).decode()
+_bad30 = "sha512-" + _b64_30.b64encode(hashlib.sha512(b"abd").digest()).decode()
+check("verify_integrity：sha512 三态（正确 True / 不符 False / 缺失或异算法 None=跳过）",
+      U30.verify_integrity(b"abc", _good30) is True
+      and U30.verify_integrity(b"abc", _bad30) is False
+      and U30.verify_integrity(b"abc", None) is None
+      and U30.verify_integrity(b"abc", "sha1-ZW5j") is None,
+      (U30.verify_integrity(b"abc", _bad30), U30.verify_integrity(b"abc", None)))
+
+# --- 30.5 幂等语义（stub 网络函数，全程离线） ---
+_tmp30 = _tf_30.mkdtemp(prefix="qd-umid-")
+try:
+    _dest30 = os.path.join(_tmp30, "umid")
+    _tgt30 = os.path.join(_dest30, "runtime-info")
+    _missing30 = U30.is_installed(_tgt30, "elf-x86_64")
+    os.makedirs(_dest30, exist_ok=True)
+    with open(_tgt30, "wb") as fh30:
+        fh30.write(_WASM30 + b"\x00" * 32)
+    _bad30_state = U30.is_installed(_tgt30, "elf-x86_64")
+    with open(_tgt30, "wb") as fh30:
+        fh30.write(_ELF_X30)
+    _ok30_state = U30.is_installed(_tgt30, "elf-x86_64")
+    check("is_installed：不存在 False / 内容不符 False / 校验通过 True（不看文件大小或名字）",
+          _missing30 is False and _bad30_state is False and _ok30_state is True,
+          (_missing30, _bad30_state, _ok30_state))
+
+    _calls30 = []
+    _orig_rt30, _orig_dl30 = U30.resolve_tarball, U30.download_tarball
+    U30.resolve_tarball = lambda *a, **k: (_calls30.append("resolve")
+                                           or ("9.9.9", "http://invalid", None))
+    U30.download_tarball = lambda *a, **k: (_calls30.append("download") or b"")
+    try:
+        with _cl_30.redirect_stdout(_io_30.StringIO()):
+            _rc_skip30 = U30.main(["--platform", "linux", "--arch", "x64",
+                                   "--dest", _dest30])
+        _calls_after_skip30 = list(_calls30)
+        with open(_tgt30, "wb") as fh30:
+            fh30.write(_WASM30 + b"\x00" * 32)          # 破坏目标 -> 应重新下载
+        try:
+            with _cl_30.redirect_stdout(_io_30.StringIO()):
+                _rc_redl30 = U30.main(["--platform", "linux", "--arch", "x64",
+                                       "--dest", _dest30])
+        except Exception as _exc30:
+            _rc_redl30 = "异常:%s" % type(_exc30).__name__
+        _calls_after_redl30 = list(_calls30)
+    finally:
+        U30.resolve_tarball, U30.download_tarball = _orig_rt30, _orig_dl30
+    check("幂等：目标已存在且校验通过 -> main() 返回 0 且一个网络函数都没被调用",
+          _rc_skip30 == 0 and _calls_after_skip30 == [],
+          (_rc_skip30, _calls_after_skip30))
+    check("幂等反例：目标校验不通过 -> 确实走下载路径（不是无条件跳过）",
+          _calls_after_redl30[:1] == ["resolve"] and _rc_redl30 != 0,
+          (_rc_redl30, _calls_after_redl30))
+
+    # --- 30.6 端到端（全离线）：伪造 npm tarball -> 扫描 -> 选择 -> 安装 ---
+    # 端到端必须用"长度达标"的样本，否则扫描阶段（BLOB_MIN_LEN）就会漏掉它
+    _bundle_src30 = 'const blob = "%s";\n' % _b64_30.b64encode(_ELF_BIG30).decode()
+    _buf30 = _io_30.BytesIO()
+    with _tfmod_30.open(fileobj=_buf30, mode="w:gz") as _tf30:
+        _info30 = _tfmod_30.TarInfo(U30.BUNDLE_MEMBER)
+        _payload30 = _bundle_src30.encode("utf-8")
+        _info30.size = len(_payload30)
+        _tf30.addfile(_info30, _io_30.BytesIO(_payload30))
+    _tgz30 = _buf30.getvalue()
+    _e2e_calls30 = []
+    _orig_rt30b, _orig_dl30b = U30.resolve_tarball, U30.download_tarball
+    U30.resolve_tarball = lambda *a, **k: (_e2e_calls30.append("resolve")
+                                           or ("9.9.9", "http://invalid", None))
+    U30.download_tarball = lambda *a, **k: (_e2e_calls30.append("download") or _tgz30)
+    try:
+        with _cl_30.redirect_stdout(_io_30.StringIO()):
+            _rc_e2e30 = U30.main(["--platform", "linux", "--arch", "x64",
+                                  "--dest", _dest30])
+    finally:
+        U30.resolve_tarball, U30.download_tarball = _orig_rt30b, _orig_dl30b
+    check("端到端（全离线）：伪造 tarball -> main() 完成提取并落盘，产物校验通过",
+          _rc_e2e30 == 0 and _e2e_calls30 == ["resolve", "download"]
+          and U30.is_installed(_tgt30, "elf-x86_64"),
+          (_rc_e2e30, _e2e_calls30, U30.is_installed(_tgt30, "elf-x86_64")))
+finally:
+    _sh_30.rmtree(_tmp30, ignore_errors=True)
+
+# --- 30.7 与网关的落盘/发现契约 ---
+_acc_src30 = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "qoder_accounts.py"), encoding="utf-8").read()
+check("落盘契约：安装文件名/目录名与 gateway POSIX 查找路径同源"
+      "（runtime-info / umid / QD_UMID_DIR）",
+      U30.TARGET_FILENAME == "runtime-info"
+      and U30.DEFAULT_DEST_DIRNAME == "umid"
+      and "QD_UMID_DIR" in _acc_src30
+      and '"umid"' in _acc_src30 and '"runtime-info"' in _acc_src30,
+      (U30.TARGET_FILENAME, U30.DEFAULT_DEST_DIRNAME))
+_orig_env30 = os.environ.get("QD_UMID_DIR")
+_tmp30b = _tf_30.mkdtemp(prefix="qd-umid-env-")
+try:
+    os.environ["QD_UMID_DIR"] = _tmp30b
+    _dd_env30 = U30.default_dest_dir()
+finally:
+    if _orig_env30 is None:
+        os.environ.pop("QD_UMID_DIR", None)
+    else:
+        os.environ["QD_UMID_DIR"] = _orig_env30
+    _sh_30.rmtree(_tmp30b, ignore_errors=True)
+_dd_default30 = U30.default_dest_dir()
+check("default_dest_dir()：$QD_UMID_DIR 优先；默认 <repo>/umid（与 gateway 查找顺序一致）",
+      _dd_env30 == _tmp30b
+      and _dd_default30 == os.path.join(
+          os.path.dirname(os.path.abspath(U30.__file__)), "umid")
+      and _dd_default30 != _dd_env30,
+      (_dd_env30, _dd_default30))
+# 真实产物校验（仓库里存在才断言，否则显式 SKIP——绝不静默）：
+# umid/ 已被 .gitignore 忽略，CI/他人机器上通常没有，所以这条按环境降级为 SKIP。
+_umid_real30 = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "umid", "runtime-info")
+if os.path.isfile(_umid_real30):
+    with open(_umid_real30, "rb") as _fh30b:
+        _umid_data30 = _fh30b.read()
+    check("真实产物：umid/runtime-info 被识别为 elf-x86_64 且落在体积启发式区间"
+          "（提取链路端到端产物，非合成样本）",
+          U30.identify_blob(_umid_data30) == "elf-x86_64"
+          and U30.verify_component(_umid_data30, "elf-x86_64")
+          and U30.HEURISTIC_SIZE_MIN <= len(_umid_data30) <= U30.HEURISTIC_SIZE_MAX,
+          (len(_umid_data30), U30.identify_blob(_umid_data30)))
+print()
+print("[31] issue #11 工具结果回声 + 标记常量契约 + issue #12 原生桥失败可见性")
+
+# --- 31.1 #11 判据：吞掉 / 不吞（直接调用判据函数，离线） ---
+_TR31 = P.TOOL_RESULT_MARKER          # "[工具结果"（值不含 ]，写入侧拼 name）
+_TC31 = P.TOOL_RESULT_CLOSE           # "[工具结果结束]"（模型自造的闭标记）
+_NAMES31 = {"terminal"}
+_PROD31 = (_TR31 + "]\n" + '{"output":"ok"}' + "\n" + _TC31 + "\n"
+           "<system_warning>x</system_warning>")
+check("#11 判据·吞：生产样本（开标记 + JSON + 自造闭标记 + 夹带 system_warning）",
+      P._tool_echo_droppable(_PROD31, _NAMES31) is True)
+check("#11 判据·吞：截断（无闭标记，body 以 { 开头）",
+      P._tool_echo_droppable(_TR31 + "]\n" + '{"output": "partial', _NAMES31) is True)
+check("#11 判据·吞：只有开标记（退化形态，与 #9 的纯 marker 一致）",
+      P._tool_echo_droppable(_TR31 + "]", _NAMES31) is True)
+check("#11 判据·吞：带 name 的开标记行（写入侧真实形态）",
+      P._tool_echo_droppable(_TR31 + " (terminal)]\n" + '{"a":1}', _NAMES31) is True)
+check("#11 判据·不吞：标记后跟自然语言散文（fail-open）",
+      P._tool_echo_droppable(_TR31 + "] 这段是普通说明", _NAMES31) is False)
+check("#11 判据·不吞：不以标记开头（讨论该标记的普通回复）",
+      P._tool_echo_droppable("网关会写入 " + _TR31 + "] 这样的提示", _NAMES31) is False)
+check("#11 判据·不吞：未声明 tools（allowed_names 为 None / 空集）",
+      P._tool_echo_droppable(_PROD31, None) is False
+      and P._tool_echo_droppable(_PROD31, set()) is False)
+check("#11 判据·不吞：标记行未闭合 / 跨行闭合（不是网关形态）",
+      P._tool_echo_droppable(_TR31 + " 没有右括号", _NAMES31) is False
+      and P._tool_echo_droppable(_TR31 + "\n换行后才]闭合", _NAMES31) is False)
+check("#11 hold-back：标记未打完要压住，证伪（散文）立即放行；统一暂存包含两种回声",
+      P._tool_echo_prefix_hold("[工") is True
+      and P._tool_echo_prefix_hold(_TR31 + "] 散文说明") is False
+      and P._echo_hold_candidate(P.LEAK_MARKER + "\n[") is True
+      and P._echo_hold_candidate(_TR31 + "]") is True)
+
+# --- 31.2 #11 三条链路端到端（复用 [27] 段的帧辅助） ---
+_fr31_drop = [json.loads(f[6:]) for f in P.recover_leaked_tool_calls(
+    iter([_raw27(_PROD31[:10]), _raw27(_PROD31[10:]), _raw27("", "stop")]),
+    _NAMES31)]
+_text31_drop = "".join(_f["choices"][0]["delta"].get("content") or ""
+                       for _f in _fr31_drop)
+check("#11 流式：开闭对回声被吞（正文空、无标记泄漏、finish_reason 仍 stop）",
+      _text31_drop == ""
+      and _TR31 not in json.dumps(_fr31_drop, ensure_ascii=False)
+      and _fr31_drop[-1]["choices"][0]["finish_reason"] == "stop",
+      _text31_drop)
+_trunc31 = _TR31 + "]\n" + '{"output": "partial'
+_fr31_tr = [json.loads(f[6:]) for f in P.recover_leaked_tool_calls(
+    iter([_raw27(_trunc31[:8]), _raw27(_trunc31[8:]), _raw27("", "stop")]),
+    _NAMES31)]
+_text31_tr = "".join(_f["choices"][0]["delta"].get("content") or ""
+                     for _f in _fr31_tr)
+check("#11 流式：截断回声被吞（正文空）", _text31_tr == "", _text31_tr)
+_fr31_keep = [json.loads(f[6:]) for f in P.recover_leaked_tool_calls(
+    iter([_raw27(_TR31 + "] 这是一段解释文字。"), _raw27("", "stop")]), _NAMES31)]
+_text31_keep = "".join(_f["choices"][0]["delta"].get("content") or ""
+                       for _f in _fr31_keep)
+check("#11 流式：散文形态原样透传（fail-open 不吞字）",
+      _TR31 in _text31_keep and "解释文字" in _text31_keep, _text31_keep)
+_obj31 = P.aggregate_stream(
+    _Resp27([_env27(_PROD31[:12]), _env27(_PROD31[12:]), _env27("", "stop")]),
+    "m31", None, allowed_names=_NAMES31)
+_msg31 = _obj31["choices"][0]["message"]
+check("#11 非流式：content 清空、无 tool_calls、finish=stop（与 #9 同语义）",
+      _msg31.get("content") == "" and not _msg31.get("tool_calls")
+      and _obj31["choices"][0]["finish_reason"] == "stop", _msg31)
+_ev31 = "".join(f.decode() for f in P.stream_responses_events(
+    iter([_raw27(_PROD31[:12]), _raw27(_PROD31[12:]), _raw27("", "stop")]),
+    "m31", {"usage": None, "custom_names": set(), "allowed_names": _NAMES31}))
+check("#11 Responses 流式：事件里既无开标记也无闭标记",
+      _TR31 not in _ev31 and _TC31 not in _ev31)
+
+# --- 31.3 标记常量契约：写入侧引用常量 + 写出字节逐字节不变 ---
+_src31 = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "qoder_proxy.py"), encoding="utf-8").read()
+check("#11 写入侧引用常量（源码里不得再有 [工具结果%s] 裸模板）",
+      'TOOL_RESULT_MARKER + name + "]\\n"' in _src31
+      and '"[工具结果%s]"' not in _src31,
+      [_l.strip() for _l in _src31.splitlines() if "[工具结果" in _l][:3])
+_sys31, _flat31, _img31 = P.flatten_messages([
+    {"role": "tool", "name": "t", "content": "X"},
+    {"role": "tool", "content": "Y"}])
+_flat_set31 = {m["content"] for m in _flat31}
+check("#11 写入格式逐字节不变（常量拼接结果 == 旧字面量模板）",
+      "[工具结果 (t)]\nX" in _flat_set31 and "[工具结果]\nY" in _flat_set31
+      and (_TR31 + " (t)]\nX") in _flat_set31,
+      sorted(_flat_set31))
+
+# --- 31.4 issue #12：原生桥失败的可见性（打桩 scenario，全程离线） ---
+import contextlib as _cl31
+import io as _io31
+import shutil as _sh31
+import tempfile as _tf31
+_tmp31 = _tf31.mkdtemp(prefix="qd-exec31-")
+try:
+    _exe31 = os.path.join(_tmp31, "runtime-info")
+    with open(_exe31, "w", encoding="utf-8") as _fh31:
+        _fh31.write("#!/bin/sh\necho hi\n")        # 存在但不是可执行的原生组件
+    _orig_rie31 = A.runtime_info_exe
+    _orig_warned31 = set(A._runtime_info_warned)
+    try:
+        A._runtime_info_warned.clear()
+        A.runtime_info_exe = lambda realm: ""
+        _err31_missing = _io31.StringIO()
+        with _cl31.redirect_stderr(_err31_missing):
+            _res31_missing = A.run_runtime_info("cn", "u31")
+        check("#12 组件不存在：静默降级（返回 {} 且 stderr 无任何提示）",
+              _res31_missing == {} and _err31_missing.getvalue() == "",
+              _err31_missing.getvalue()[:120])
+
+        A._runtime_info_warned.clear()
+        A.runtime_info_exe = lambda realm: _exe31
+        _err31_exec = _io31.StringIO()
+        with _cl31.redirect_stderr(_err31_exec):
+            _res31_exec = A.run_runtime_info("cn", "u31")
+        _msg31_exec = _err31_exec.getvalue()
+        check("#12 组件在但执行失败：返回 {} 且 stderr 有可诊断提示"
+              "（[runtime-info] 前缀 + 组件路径 + 修法提示）",
+              _res31_exec == {} and "[runtime-info]" in _msg31_exec
+              and _exe31 in _msg31_exec and "无法执行" in _msg31_exec,
+              _msg31_exec[:200])
+        check("#12 两种情况可区分：'不存在' 完全静默 vs '跑不起来' 有提示",
+              _err31_missing.getvalue() == "" and _msg31_exec != "")
+        _err31_again = _io31.StringIO()
+        with _cl31.redirect_stderr(_err31_again):
+            A.run_runtime_info("cn", "u31")
+        check("#12 同一类失败同进程只提示一次（批量签到不刷屏）",
+              _err31_again.getvalue() == "", _err31_again.getvalue()[:120])
+    finally:
+        A.runtime_info_exe = _orig_rie31
+        A._runtime_info_warned.clear()
+        A._runtime_info_warned.update(_orig_warned31)
+finally:
+    _sh31.rmtree(_tmp31, ignore_errors=True)
+
+print()
+print("[32] task-32 结构化直传：产物字段形态 / 双路径对照 / 开关三态 / fail-safe")
+
+_MSGS32 = [
+    {"role": "user", "content": "查天气"},
+    {"role": "assistant", "content": None,
+     "tool_calls": [{"id": "call_1", "type": "function",
+                     "function": {"name": "get_weather",
+                                  "arguments": {"city": "SZ"}}}]},
+    {"role": "tool", "tool_call_id": "call_1", "name": "get_weather",
+     "content": "25C"},
+    {"role": "user", "content": "结果呢？"},
+]
+_sys32, _flat_s32, _img32 = P.flatten_messages(_MSGS32, structured=True)
+_tool32 = [m for m in _flat_s32 if m.get("role") == "tool"]
+_asst32 = [m for m in _flat_s32
+           if m.get("role") == "assistant" and m.get("tool_calls")]
+check("结构化产物：tool 消息保留 role + tool_call_id，content 为字符串且保留正文",
+      len(_tool32) == 1 and _tool32[0].get("tool_call_id") == "call_1"
+      and isinstance(_tool32[0].get("content"), str)
+      and "25C" in _tool32[0]["content"],
+      _tool32)
+check("结构化产物：assistant.tool_calls 保留 id/type/function，arguments 归一为 JSON 字符串",
+      len(_asst32) == 1
+      and _asst32[0]["tool_calls"][0].get("id") == "call_1"
+      and _asst32[0]["tool_calls"][0].get("type") == "function"
+      and _asst32[0]["tool_calls"][0].get("function", {}).get("name") == "get_weather"
+      and isinstance(_asst32[0]["tool_calls"][0]["function"].get("arguments"), str)
+      and json.loads(_asst32[0]["tool_calls"][0]["function"]["arguments"])["city"] == "SZ",
+      _asst32)
+check("结构化产物：**不存在 None content**（task-31 实测 null 会被 DeepSeek/Kimi 拒绝）",
+      all(m.get("content") is not None for m in _flat_s32)
+      and all(m.get("content") == "" or isinstance(m.get("content"), str)
+              for m in _flat_s32),
+      [(m.get("role"), m.get("content")) for m in _flat_s32])
+_sys32b, _flat_t32, _img32b = P.flatten_messages(_MSGS32, structured=False)
+check("双路径对照：文本化把 tool 降级为 user+TOOL_RESULT_MARKER，结构化保留 role=tool",
+      any(m.get("role") == "user"
+          and str(m.get("content") or "").startswith(P.TOOL_RESULT_MARKER)
+          for m in _flat_t32)
+      and not any(m.get("role") == "tool" for m in _flat_t32)
+      and any(m.get("role") == "tool" for m in _flat_s32),
+      [m.get("role") for m in _flat_t32])
+check("双路径对照：文本化把 assistant.tool_calls 序列化进 content（LEAK_MARKER），结构化不写正文",
+      any(P.LEAK_MARKER in str(m.get("content") or "")
+          for m in _flat_t32 if m.get("role") == "assistant")
+      and not any("tool_calls" in m for m in _flat_t32)
+      and all("tool_calls" in m for m in _asst32),
+      [str(m.get("content"))[:60] for m in _flat_t32 if m.get("role") == "assistant"])
+
+_orig_env32 = os.environ.pop("QD_STRUCTURED_TOOL_HISTORY", None)
+try:
+    _auto_cn_qwen = P.structured_tool_history_enabled(
+        "Qwen3.8-Flash", "qfmodel", "cn", _MSGS32)
+    _auto_cn_glm = P.structured_tool_history_enabled(
+        "GLM-5.3-Flash", "gm53flash", "cn", _MSGS32)
+    _auto_cn_glm2 = P.structured_tool_history_enabled(
+        "glm-4.6", "glm4x", "cn", _MSGS32)
+    _auto_cn_ds = P.structured_tool_history_enabled(
+        "DeepSeek-Flash", "dfmodel", "cn", _MSGS32)
+    _auto_cn_kimi = P.structured_tool_history_enabled(
+        "Kimi-K2.8-Preview", "kmodel", "cn", _MSGS32)
+    _auto_intl_qwen = P.structured_tool_history_enabled(
+        "Qwen3.8-Flash", "qfmodel", "intl", _MSGS32)
+    _unk_mode = None
+    os.environ["QD_STRUCTURED_TOOL_HISTORY"] = "banana"
+    _unk_mode = P._structured_mode()
+    os.environ["QD_STRUCTURED_TOOL_HISTORY"] = "on"
+    _on_cn_ds = P.structured_tool_history_enabled(
+        "DeepSeek-Flash", "dfmodel", "cn", _MSGS32)
+    _on_intl_ds = P.structured_tool_history_enabled(
+        "DeepSeek-Flash", "dfmodel", "intl", _MSGS32)
+    os.environ["QD_STRUCTURED_TOOL_HISTORY"] = "off"
+    _off_cn_qwen = P.structured_tool_history_enabled(
+        "Qwen3.8-Flash", "qfmodel", "cn", _MSGS32)
+finally:
+    if _orig_env32 is None:
+        os.environ.pop("QD_STRUCTURED_TOOL_HISTORY", None)
+    else:
+        os.environ["QD_STRUCTURED_TOOL_HISTORY"] = _orig_env32
+
+check("开关三态·auto：默认只放行 CN+白名单（Qwen/GLM/gm4 真；DeepSeek/Kimi/INTL 假）",
+      _auto_cn_qwen is True and _auto_cn_glm is True and _auto_cn_glm2 is True
+      and _auto_cn_ds is False and _auto_cn_kimi is False
+      and _auto_intl_qwen is False,
+      (_auto_cn_qwen, _auto_cn_glm, _auto_cn_ds, _auto_cn_kimi, _auto_intl_qwen))
+check("开关三态·on/off：on 强制放行（含 DeepSeek/INTL），off 一律关闭",
+      _on_cn_ds is True and _on_intl_ds is True and _off_cn_qwen is False,
+      (_on_cn_ds, _on_intl_ds, _off_cn_qwen))
+check("开关三态·未知值回落 auto（不误开）；恢复后默认仍是 auto",
+      _unk_mode == "auto" and P._structured_mode() == "auto",
+      (_unk_mode, P._structured_mode()))
+
+_bad_ids32 = [
+    {"role": "user", "content": "x"},
+    {"role": "assistant", "content": "",
+     "tool_calls": [{"id": "", "function": {"name": "f"}}]},
+    {"role": "tool", "tool_call_id": "", "content": "y"},
+]
+check("fail-safe：id 不齐备（tool_call_id / tool_calls.id 空）→ 恒回退文本化",
+      P._tool_ids_ok(_bad_ids32) is False
+      and P.structured_tool_history_enabled(
+          "Qwen3.8-Flash", "qfmodel", "cn", _bad_ids32) is False)
+try:
+    os.environ["QD_STRUCTURED_TOOL_HISTORY"] = "on"
+    _on_bad_ids = P.structured_tool_history_enabled(
+        "Qwen3.8-Flash", "qfmodel", "cn", _bad_ids32)
+finally:
+    if _orig_env32 is None:
+        os.environ.pop("QD_STRUCTURED_TOOL_HISTORY", None)
+    else:
+        os.environ["QD_STRUCTURED_TOOL_HISTORY"] = _orig_env32
+check("fail-safe：即使显式 on，id 不齐备也不放行（宁可少用不发畸形请求）",
+      _on_bad_ids is False, _on_bad_ids)
+
+_r32 = [{"role": "assistant", "content": "x", "reasoning_content": "think",
+         "tool_calls": [{"id": "c1", "type": "function",
+                         "function": {"name": "f", "arguments": "{}"}}]}]
+_, _flat_r_on32, _ = P.flatten_messages(_r32, keep_reasoning=True, structured=True)
+_, _flat_r_off32, _ = P.flatten_messages(_r32, keep_reasoning=False, structured=True)
+check("结构化产物：reasoning_content 仍按 keep_reasoning 规则保留（与文本化路径一致）",
+      _flat_r_on32[0].get("reasoning_content") == "think"
+      and "reasoning_content" not in _flat_r_off32[0],
+      (_flat_r_on32[0].get("reasoning_content"), _flat_r_off32[0].keys()))
+_args_none32 = P.flatten_messages(
+    [{"role": "assistant", "content": "",
+      "tool_calls": [{"id": "c1", "function": {"name": "f",
+                                               "arguments": None}}]}],
+    structured=True)[1][0]["tool_calls"][0]["function"]["arguments"]
+_args_scalar32 = P.flatten_messages(
+    [{"role": "assistant", "content": "",
+      "tool_calls": [{"id": "c1", "function": {"name": "f",
+                                               "arguments": 42}}]}],
+    structured=True)[1][0]["tool_calls"][0]["function"]["arguments"]
+print()
+print("[33] issue #16 误伤边界：帧尾 marker 前缀 hold 不得吞掉正常文本、不得延迟恢复")
+
+
+def _f33(content, fin=None):
+    delta = {}
+    if content is not None:
+        delta["content"] = content
+    inner = {"id": "c33", "model": "m33", "created": 1,
+             "choices": [{"index": 0, "delta": delta, "finish_reason": fin}]}
+    return ("data: " + json.dumps(inner, ensure_ascii=False) + "\n\n").encode("utf-8")
+
+
+def _join33(chunks, names=None):
+    return "".join(json.loads(f[6:])["choices"][0]["delta"].get("content") or ""
+                   for f in P.recover_leaked_tool_calls(iter(chunks), names))
+
+
+_M33 = P.LEAK_MARKER
+_NAMES33 = {"terminal"}
+
+_t33a = "数组是这样的：\n["
+check("误伤①：正文以 '[' 结尾（未闭合 JSON 引用）→ 原样透传，不被吞",
+      _join33([_f33(_t33a), _f33("", "stop")], _NAMES33) == _t33a,
+      _join33([_f33(_t33a), _f33("", "stop")], _NAMES33))
+_t33b = "看这个 [ass"
+check("误伤②：正文以 '[ass'（marker 前缀但未完整）结尾 → 跨帧后原样透传",
+      _join33([_f33(_t33b), _f33(" 只是标记的开头", "stop")], _NAMES33)
+      == _t33b + " 只是标记的开头",
+      _join33([_f33(_t33b), _f33(" 只是标记的开头", "stop")], _NAMES33))
+_t33c = "网关会写入 " + _M33 + " 这样的提示，不是真的调用。"
+check("误伤③：含 marker 但后面是自然语言 → 原样透传（讨论而非调用）",
+      _join33([_f33(_t33c), _f33("", "stop")], _NAMES33) == _t33c)
+_calls33 = json.dumps([{"name": "terminal",
+                        "arguments": json.dumps({"cmd": "ls"}, ensure_ascii=False)}],
+                      ensure_ascii=False)
+_t33d = _M33 + "\n" + _calls33
+_fr33d = [json.loads(f[6:]) for f in P.recover_leaked_tool_calls(
+    iter([_f33(_t33d), _f33("", "stop")]), _NAMES33)]
+check("误伤④：marker + 完整合法数组 → 走恢复路径（tool_calls 增量），既不吞也不泄漏",
+      any(f["choices"][0]["delta"].get("tool_calls") for f in _fr33d)
+      and _M33 not in json.dumps(_fr33d, ensure_ascii=False)
+      and not any(f["choices"][0]["delta"].get("content") for f in _fr33d),
+      _fr33d)
+_t33e = "格式是 [a-z]+ 这种正则，或者 [1,2,3] 这种数组。"
+check("误伤⑤：正文含 '[' 但不以 marker 开头 → 原样透传",
+      _join33([_f33(_t33e), _f33("", "stop")], _NAMES33) == _t33e)
+_t33f = "第一段 [ass"
+_t33f2 = "istant 请求调用工具] 不是 marker 全文"
+_fr33f = [json.loads(f[6:]) for f in P.recover_leaked_tool_calls(
+    iter([_f33(_t33f), _f33(_t33f2, "stop")]), _NAMES33)]
+_text33f = "".join(f["choices"][0]["delta"].get("content") or "" for f in _fr33f)
+check("误伤⑥：跨帧拼接内容守恒（正常文本不丢字、不被误吞；含 marker 字样也照传）",
+      _text33f == _t33f + _t33f2, _text33f)
+
+# --- issue #16 五形态：用汤圆给作者的**原样样本**（A/B1/B2/B3/C） ---
+_M16 = P.LEAK_MARKER
+_A16 = _M16 + "\n" + '[{"name": "terminal", "arguments": "{\\"cmd\\": \\"ls'
+_B116 = "我先看看目录结构。" + "\n\n" + _A16
+_B216 = ["我先看看目录结构。\n\n", _A16]
+_B316 = _M16 + "\n" + \
+    '[{"name": "terminal", "arguments": "{\\"cmd\\": \\"echo \\u63a'
+_C16 = "[工具结果]" + "\n" + '{"output": "ok"}' + "\n" + "[工具结果结束]"
+
+
+def _frames16(chunks):
+    return [json.loads(f[6:]) for f in
+            P.recover_leaked_tool_calls(iter(chunks), _NAMES33)]
+
+
+def _text16(frames):
+    return "".join(f["choices"][0]["delta"].get("content") or "" for f in frames)
+
+
+def _fin16(frames):
+    return frames[-1]["choices"][0].get("finish_reason")
+
+
+_frA16 = _frames16([_f33(_A16[:20]), _f33(_A16[20:]), _f33("", "stop")])
+check("#16·A（原样样本：marker+截断 JSON 切两刀）→ 内容不含标记、收尾帧 finish_reason=stop",
+      _M16 not in _text16(_frA16) and _fin16(_frA16) == "stop", _text16(_frA16))
+_frB116 = _frames16([_f33(_B116), _f33("", "stop")])
+check("#16·B1（原样样本：散文+marker 同帧）→ 散文保留、标记不泄漏、finish=stop",
+      "我先看看目录结构。" in _text16(_frB116)
+      and _M16 not in _text16(_frB116) and _fin16(_frB116) == "stop",
+      _text16(_frB116))
+_frB216 = _frames16([_f33(x) for x in _B216] + [_f33("", "stop")])
+check("#16·B2（原样样本：散文与 marker 分帧）→ 散文保留、标记不泄漏、finish=stop",
+      "我先看看目录结构。" in _text16(_frB216)
+      and _M16 not in _text16(_frB216) and _fin16(_frB216) == "stop",
+      _text16(_frB216))
+_frB316 = _frames16([_f33(_B316[:20]), _f33(_B316[20:]), _f33("", "stop")])
+check("#16·B3（原样样本：\\u63a 未写完转义）→ 内容不含标记、finish=stop",
+      _M16 not in _text16(_frB316) and _fin16(_frB316) == "stop",
+      _text16(_frB316))
+_frC16 = _frames16([_f33(_C16[:8]), _f33(_C16[8:]), _f33("", "stop")])
+check("#16·C（原样样本：工具结果回声）→ 不含 \"[工具结果\"、finish=stop（#11 回归保护）",
+      "[工具结果" not in _text16(_frC16) and _fin16(_frC16) == "stop",
+      _text16(_frC16))
+
+# --- hold 上限：长文本以 [ 开头且久不闭合必须放行（不得无限缓冲） ---
+_HOLD_LIMIT16 = getattr(P, "_MARKER_HOLD_WINDOW", None)
+check("#16·hold 窗口常量存在且为标记长度量级（不是无上限）",
+      isinstance(_HOLD_LIMIT16, int) and 1 <= _HOLD_LIMIT16 <= 64, _HOLD_LIMIT16)
+_long16 = "[" + ("x" * 2000)
+_frLong16 = _frames16([_f33(_long16[:500]), _f33(_long16[500:]), _f33("", "stop")])
+check("#16·hold 上限：长文本以 '[' 开头且久不闭合 → 内容全部放行、不丢字",
+      _text16(_frLong16) == _long16,
+      (len(_text16(_frLong16)), len(_long16)))
+_frFirst16 = _frames16([_f33(_long16[:500]), _f33("", "stop")])
+_emitFirst16 = _text16(_frFirst16)
+print()
+print("[34] task-37 细致复查：长链/反转/其它截断点/窗口与上限边界/结构化交互")
+
+
+def _run34(chunks, names=None):
+    """返回 (客户端文本, tool_calls 帧数, 末帧 finish_reason)。"""
+    _txt, _tcs, _fin = [], 0, None
+    for _f in P.recover_leaked_tool_calls(iter(chunks), names or _NAMES33):
+        try:
+            _o = json.loads(_f.decode("utf-8")[6:] if isinstance(_f, bytes) else _f[6:])
+        except Exception:
+            continue
+        _d = _o["choices"][0]["delta"]
+        if _d.get("content"):
+            _txt.append(_d["content"])
+        if _d.get("tool_calls"):
+            _tcs += 1
+        if _o["choices"][0].get("finish_reason"):
+            _fin = _o["choices"][0]["finish_reason"]
+    return "".join(_txt), _tcs, _fin
+
+
+_CALLS34 = json.dumps([{"name": "terminal",
+                        "arguments": json.dumps({"cmd": "ls"}, ensure_ascii=False)}],
+                      ensure_ascii=False)
+_LONG34 = _M33 + "\n" + _CALLS34
+_chunks34 = [_f33(_LONG34[i:i + 6]) for i in range(0, len(_LONG34), 6)]
+_t34a, _tc34a, _fin34a = _run34(_chunks34 + [_f33("", "stop")])
+check("#37·长链：marker+JSON 切成 %d 帧 → 恢复为 tool_calls、无泄漏、finish=tool_calls"
+      % len(_chunks34),
+      _tc34a > 0 and _t34a == "" and _fin34a == "tool_calls",
+      (_tc34a, _fin34a, _t34a[:60]))
+
+for _tag, _parts in (
+        ("1b 疑似 marker 后证伪（散文首帧）",
+         ["我先看看目录结构。\n\n", "[assis", "tant 请求调用工具] 这只是一段说明文字"]),
+        ("1c 前缀被打断", ["[assis", "这只是一个普通说明，不是标记。"]),
+        ("1d 完整 marker 但后接散文", ["[assistant 请求调用工具", "]\n这不是数组，是中文说明"])):
+    _want = "".join(_parts)
+    _got, _tc, _fn = _run34([_f33(x) for x in _parts] + [_f33("", "stop")])
+    # 注意：反转=已证伪为普通文本 → 原样补发，**marker 明文出现是正确行为**
+    # （模型确实在讨论该标记）；这里只要求内容守恒且不被误判为工具调用。
+    check("#37·反转（%s）→ 证伪后完整补发（内容逐字节守恒、不误判为 tool_calls）" % _tag,
+          _got == _want and _tc == 0,
+          (len(_got), len(_want), _got[:60]))
+
+for _tag, _payload in (
+        ("2a 代理对半截 \\ud83d",
+         _M33 + "\n" + '[{"name": "terminal", "arguments": "{\\"cmd\\": \\"echo \\ud83d'),
+        ("2b 双重转义 \\\\u63a2",
+         _M33 + "\n" + '[{"name": "terminal", "arguments": "{\\"cmd\\": \\"echo \\\\u63a2'),
+        ("2c \\u63a 与 2 分帧",
+         _M33 + "\n" + '[{"name": "terminal", "arguments": "{\\"cmd\\": \\"echo \\u63a')):
+    _cut = len(_payload) // 2
+    _t, _tc, _fn = _run34([_f33(_payload[:_cut]), _f33(_payload[_cut:]),
+                           _f33("", "stop")])
+    check("#37·截断点（%s）→ 整段被吞、无标记泄漏、finish=stop" % _tag,
+          _t == "" and _tc == 0 and _fn == "stop", _t[:60])
+
+_HOLDWIN34 = getattr(P, "_MARKER_HOLD_WINDOW", 17)
+for _cut in (_HOLDWIN34 - 1, _HOLDWIN34, _HOLDWIN34 + 1):
+    _pre, _rest = _M33[:_cut], _M33[_cut:] + "\n" + _CALLS34
+    _t, _tc, _fn = _run34([_f33(_pre), _f33(_rest), _f33("", "stop")])
+    check("#37·窗口边界：帧尾恰好 %d 字 marker 前缀 → 仍被识别（恢复 tool_calls、无泄漏）"
+          % _cut, _tc > 0 and _t == "" and _M33 not in _t, (_tc, _t[:40]))
+
+_HOLDMAX34 = getattr(P, "_HOLD_MAX_CHARS", 32768)
+_pad34 = "x" * (_HOLDMAX34 - len(_M33) - 200)
+_under34 = _M33 + "\n" + '[{"name": "terminal", "arguments": "{\\"cmd\\": \\"' + _pad34 + '\\"'
+_t, _tc, _fn = _run34([_f33(_under34[:8000]), _f33(_under34[8000:16000]),
+                       _f33(_under34[16000:]), _f33("", "stop")])
+check("#37·上限内（%d 字 < %d）未闭合块 → 仍被拦（吞掉、无泄漏）"
+      % (len(_under34), _HOLDMAX34),
+      _t == "" and _tc == 0, (len(_under34), _t[:40]))
+_blob34 = _M33 + "\n" + json.dumps(
+    [{"name": "terminal", "arguments": json.dumps({"cmd": _pad34}, ensure_ascii=False)}],
+    ensure_ascii=False)
+_c34 = len(_blob34) // 3
+_t, _tc, _fn = _run34([_f33(_blob34[:_c34]), _f33(_blob34[_c34:2 * _c34]),
+                       _f33(_blob34[2 * _c34:]), _f33("", "stop")])
+check("#37·上限内（%d 字）合法完整数组 → 恢复为 tool_calls（大数据块不被误放行）"
+      % len(_blob34),
+      _tc > 0 and _t == "" and _fn == "tool_calls", (_tc, _fn))
+_over34 = _under34 + "y" * (_HOLDMAX34 + 200 - len(_under34))
+_t, _tc, _fn = _run34([_f33(_over34[:_HOLDMAX34 // 2]), _f33(_over34[_HOLDMAX34 // 2:]),
+                       _f33("", "stop")])
+check("#37·超上限（%d 字 > %d）→ fail-open 放行，且**只输出一次**（长度守恒、无重复）"
+      % (len(_over34), _HOLDMAX34),
+      _t == _over34 and _tc == 0, (len(_t), len(_over34), _t == _over34))
+
+_msgs34 = [{"role": "user", "content": "查天气"},
+           {"role": "assistant", "content": "", "tool_calls": [
+               {"id": "c1", "type": "function",
+                "function": {"name": "get_weather", "arguments": '{"city": "SZ"}'}}]},
+           {"role": "tool", "tool_call_id": "c1", "content": "25C"}]
+_s34, _flat_s34, _ = P.flatten_messages(_msgs34, structured=True)
+_t34x, _flat_t34, _ = P.flatten_messages(_msgs34, structured=False)
+check("#37·结构化交互：结构化产物**不含**回读标记，文本化产物**含**（两者不打架）",
+      _M33 not in json.dumps(_flat_s34, ensure_ascii=False)
+      and P.TOOL_RESULT_MARKER not in json.dumps(_flat_s34, ensure_ascii=False)
+      and _M33 in json.dumps(_flat_t34, ensure_ascii=False),
+      ([m.get("role") for m in _flat_s34], [m.get("role") for m in _flat_t34]))
+_env37 = os.environ.get("QD_STRUCTURED_TOOL_HISTORY")
+try:
+    os.environ["QD_STRUCTURED_TOOL_HISTORY"] = "on"
+    _on37 = P.structured_tool_history_enabled("Qwen3.8-Flash", "qfmodel", "intl", _msgs34)
+finally:
+    if _env37 is None:
+        os.environ.pop("QD_STRUCTURED_TOOL_HISTORY", None)
+    else:
+        os.environ["QD_STRUCTURED_TOOL_HISTORY"] = _env37
+_t, _tc, _fn = _run34([_f33(_LONG34[:10]), _f33(_LONG34[10:]), _f33("", "stop")])
+check("#37·结构化交互：on 模式下回读守卫仍独立生效（同一输入仍恢复 tool_calls）",
+      _on37 is True and _tc > 0 and _M33 not in _t and _fn == "tool_calls",
+      (_on37, _tc, _fn))
+
+# --- Lead 侧补充（task-37 复查）：窗口是**功能性必需**，不是优化项 ---
+# 铁蛋的 V2 变异（把 _MARKER_HOLD_WINDOW 压到 1）没变红，是因为他的用例帧 1 是纯 marker 前缀；
+# 下面这条带散文前缀、且被切处落在窗口内 —— 实测窗口=1 时会真实泄漏，用来守住窗口参数被误改。
+_dd_pre = "我先看看：" + _M33[:9]
+_dd_rest = _M33[9:] + "\n" + _CALLS34
+_t, _tc, _fn = _run34([_f33(_dd_pre), _f33(_dd_rest), _f33("", "stop")])
+print()
+print("[35] 机器身份落盘缓存（task-48 · 设计 v1.2.13 第七节：12 条离线）")
+import shutil as _sh35
+import tempfile as _tf35
+import threading as _th35
+
+_IDC_KEYS = ("ACCOUNTS_DIR", "QD_MACHINE_IDENTITY_CACHE",
+             "QD_MACHINE_IDENTITY_CACHE_TTL", "QD_MACHINE_IDENTITY_RESET",
+             "QD_MACHINE_IDENTITY_VOTE")
+_IDC_ORIG_ENV = {_k: os.environ.get(_k) for _k in _IDC_KEYS}
+_IDC_ORIG_RUN = A.run_runtime_info
+_IDC_TMP = _tf35.mkdtemp(prefix="qd-idcache-")
+_IDC_FILE = os.path.join(_IDC_TMP, "machine_identity.json")
+
+
+def _idc_env(**over):
+    """切换 ACCOUNTS_DIR 与三个开关，并清内存缓存与落盘文件。"""
+    os.environ["ACCOUNTS_DIR"] = over.get("accounts_dir") or _IDC_TMP
+    for _k in _IDC_KEYS[1:]:
+        if over.get(_k) is not None:
+            os.environ[_k] = str(over[_k])
+        else:
+            os.environ.pop(_k, None)
+    A._native_ident_cache.clear()
+    try:
+        os.remove(_IDC_FILE)
+    except OSError:
+        pass
+
+
+def _idc_stub(calls, fail=False, seq=None):
+    """替换组件入口：记录调用次数并返回**恒定**身份（保证投票 3/3 一致）。
+
+    seq 给定时按调用序号循环取样本（用于构造多数派/全分歧场景）。
+    """
+    def _f(realm, account_id=""):
+        calls.append((realm, account_id))
+        if fail:
+            return {}
+        if seq:
+            s = seq[(len(calls) - 1) % len(seq)]
+            return dict(s)
+        return {"machineToken": "tok-1", "machineType": "ty1",
+                "machineCode": "co1", "vmInfo": {"isVm": False}}
+    return _f
+
+
+def _idc_read():
+    try:
+        with open(_IDC_FILE, encoding="utf-8") as _fh:
+            return json.load(_fh)
+    except Exception:
+        return None
+
+
+def _idc_tok(blob):
+    try:
+        return (blob.get("realm") or {}).get("cn", {}).get("machineToken")
+    except Exception:
+        return None
+
+
+try:
+    _idc_env()
+    _c1 = []
+    A.run_runtime_info = _idc_stub(_c1)
+    _i1 = A.native_machine_identity("cn", "u1")
+    _f1 = _idc_read()
+    check("#48-1 首次调用：无缓存 → 组件被调 **3** 次（首次表决）并落盘",
+          len(_c1) == 3 and _i1.get("machineToken") == "tok-1"
+          and isinstance(_f1, dict) and _f1.get("version") == 1
+          and _idc_tok(_f1) == "tok-1"
+          and ((_f1.get("realm") or {}).get("cn", {}).get("machineType") == "ty1")
+          and ((_f1.get("realm") or {}).get("cn", {}).get("machineCode") == "co1"),
+          (_c1, _f1))
+
+    A._native_ident_cache.clear()
+    _c2 = []
+    A.run_runtime_info = _idc_stub(_c2)
+    _i2 = A.native_machine_identity("cn", "u2")
+    check("#48-2 【命门】落盘缓存命中：第二次调用**不触发组件**（桩计数=0）且身份逐字节相同",
+          len(_c2) == 0 and _i2.get("machineToken") == "tok-1"
+          and _i2.get("machineType") == "ty1", (_c2, _i2))
+
+    _c3 = []
+    A.run_runtime_info = _idc_stub(_c3)
+    _i3 = A.native_machine_identity("cn", "u3", force=True)
+    check("#48-3 force=True：必调组件并覆盖落盘缓存",
+          len(_c3) == 1 and _i3.get("machineToken") == "tok-1"
+          and _idc_tok(_idc_read()) == "tok-1", (_c3, _idc_read()))
+
+    # 设计 §3.2 行 3 的场景：缓存【已过期】→ 调组件 → 组件失败 → 回退到过期缓存。
+    # （缓存未过期时按行 2 根本不会调组件，那种构造断言不到"回退"路径。）
+    _idc_env(QD_MACHINE_IDENTITY_CACHE_TTL="1")
+    _c4a = []
+    A.run_runtime_info = _idc_stub(_c4a)
+    _i4a = A.native_machine_identity("cn", "u4")
+    _f4 = _idc_read()
+    try:
+        _f4["realm"]["cn"]["cached_at"] = time.time() - 10      # 人为过期
+        with open(_IDC_FILE, "w", encoding="utf-8") as _fh:
+            json.dump(_f4, _fh, ensure_ascii=False)
+    except Exception:
+        pass
+    A._native_ident_cache.clear()
+    _c4b = []
+    A.run_runtime_info = _idc_stub(_c4b, fail=True)
+    _i4b = A.native_machine_identity("cn", "u4b")
+    check("#48-4 组件失败但落盘有（过期）缓存 → 仍返回缓存身份，且不写坏缓存文件"
+          "（首次表决 3 次、TTL 轮换 1 次）",
+          len(_c4a) == 3 and len(_c4b) == 1
+          and _i4b.get("machineToken") == _i4a.get("machineToken")
+          and _idc_tok(_idc_read()) == _i4a.get("machineToken"),
+          (_c4b, _i4b, _idc_read()))
+
+    _idc_env()
+    _c5 = []
+    A.run_runtime_info = _idc_stub(_c5, fail=True)
+    check("#48-5 组件失败且无缓存 → 表决 3 次全空 → 返回 {}（现状不变）",
+          A.native_machine_identity("cn", "u5") == {} and len(_c5) == 3)
+
+    _idc_env(QD_MACHINE_IDENTITY_CACHE="off")
+    _c6 = []
+    A.run_runtime_info = _idc_stub(_c6)
+    A.native_machine_identity("cn", "u6")
+    check("#48-6 QD_MACHINE_IDENTITY_CACHE=off → 不落盘（行为同旧）",
+          _idc_read() is None and len(_c6) == 1, _idc_read())
+
+    _idc_env(QD_MACHINE_IDENTITY_CACHE_TTL="1")
+    _c7 = []
+    A.run_runtime_info = _idc_stub(_c7)
+    A.native_machine_identity("cn", "u7")
+    _f7 = _idc_read()
+    try:
+        _f7["realm"]["cn"]["cached_at"] = time.time() - 10
+        with open(_IDC_FILE, "w", encoding="utf-8") as _fh:
+            json.dump(_f7, _fh, ensure_ascii=False)
+    except Exception:
+        pass
+    A._native_ident_cache.clear()
+    A.native_machine_identity("cn", "u7b")
+    check("#48-7 TTL 正数：过期后重新调组件（首次表决 3 + 轮换 1 = 4）",
+          len(_c7) == 4, len(_c7))
+
+    _idc_env()
+    _c8a = []
+    A.run_runtime_info = _idc_stub(_c8a)
+    A.native_machine_identity("cn", "u8")
+    os.environ["QD_MACHINE_IDENTITY_RESET"] = "1"
+    A._native_ident_cache.clear()
+    _c8b = []
+    A.run_runtime_info = _idc_stub(_c8b)
+    _i8 = A.native_machine_identity("cn", "u8b")
+    check("#48-8 QD_MACHINE_IDENTITY_RESET=1 → 清空缓存并重新取身份",
+          len(_c8b) >= 1 and bool(_i8.get("machineToken")), (len(_c8a), len(_c8b)))
+
+    _idc_env()
+    with open(_IDC_FILE, "w", encoding="utf-8") as _fh:
+        _fh.write('{"version": 1, "realm": {"cn": {"machineToken": "trunc')
+    _c9 = []
+    A.run_runtime_info = _idc_stub(_c9)
+    _err9 = None
+    try:
+        _i9 = A.native_machine_identity("cn", "u9")
+    except Exception as _e9:
+        _err9 = _e9
+        _i9 = {}
+    check("#48-9 缓存文件损坏（截断 JSON）→ 不抛异常，回退表决 3 次",
+          _err9 is None and len(_c9) == 3 and bool((_i9 or {}).get("machineToken")),
+          (_err9, len(_c9)))
+
+    _idc_env()
+    _c10 = []
+    _lk10 = _th35.Lock()
+
+    def _slow10(realm, account_id=""):
+        with _lk10:
+            _c10.append(1)
+            _n = len(_c10)
+        time.sleep(0.05)
+        return {"machineToken": "tok-%d" % _n, "machineType": "ty", "machineCode": "co"}
+
+    A.run_runtime_info = _slow10
+    _th35.Thread(target=lambda: A.native_machine_identity("cn", "t1")).start()
+    _th35.Thread(target=lambda: A.native_machine_identity("cn", "t2")).start()
+    time.sleep(0.6)
+    check("#48-10 并发首次：文件仍可解析（不损坏），且至少写入一次",
+          isinstance(_idc_read(), dict) and _idc_tok(_idc_read()) is not None,
+          _idc_read())
+
+    _idc_env()
+    _c11 = []
+    # 桩要"两次采样给不同身份"：首次表决 3 次得 tok-a、force 刷新得 tok-b，
+    # 才能区分"只更新内存"与"落盘也被更新"。
+    A.run_runtime_info = _idc_stub(_c11, seq=[
+        {"machineToken": "tok-a", "machineType": "ty-a", "machineCode": "co-a",
+         "vmInfo": {"isVm": False}}] * 3
+        + [{"machineToken": "tok-b", "machineType": "ty-b", "machineCode": "co-b",
+            "vmInfo": {"isVm": False}}])
+    A.native_machine_identity("cn", "u11")
+    _tok_before11 = _idc_tok(_idc_read())
+    _acc11 = A.Account({"uid": "heal48", "realm": "cn", "accessToken": "dt-x"})
+    _acc11.machine_identity_source = "runtime-info"
+    _orig_get11 = A.Account._campaigns_get
+    _seq11 = []
+
+    def _cget11(self):
+        _seq11.append(1)
+        return (({"showCampaign": False} if len(_seq11) == 1
+                 else {"showCampaign": True}), 200, "")
+
+    A.Account._campaigns_get = _cget11
+    try:
+        _acc11.campaigns(force=True)
+    finally:
+        A.Account._campaigns_get = _orig_get11
+    _tok_after11 = _idc_tok(_idc_read())
+    check("#48-11 自愈路径：列表被拒 → force 刷新 → **落盘被更新**（不只更新内存）",
+          len(_c11) >= 2 and _tok_before11 != _tok_after11,
+          (_tok_before11, _tok_after11, len(_c11)))
+
+    _idc_env()
+    with open(_IDC_FILE, "w", encoding="utf-8") as _fh:
+        json.dump({"version": 1, "realm": {"cn": {"machineToken": ""}}}, _fh)
+    _c12 = []
+    A.run_runtime_info = _idc_stub(_c12)
+    _i12 = A.native_machine_identity("cn", "u12")
+    check("#48-12 缓存字段缺失（machineToken 空）→ 视为无缓存，回退表决 3 次",
+          len(_c12) == 3 and (_i12 or {}).get("machineToken") == "tok-1",
+          (len(_c12), _i12))
+
+    check("#48-13a 表决上限常量：IDENTITY_VOTE_ROUNDS=3 + EXTEND=2 → 上限 5（延迟有界）",
+          getattr(A, "IDENTITY_VOTE_ROUNDS", None) == 3
+          and getattr(A, "IDENTITY_VOTE_EXTEND_ROUNDS", None) == 2,
+          (getattr(A, "IDENTITY_VOTE_ROUNDS", None),
+           getattr(A, "IDENTITY_VOTE_EXTEND_ROUNDS", None)))
+
+    # ---- 13 表决：3 次同值 → 组件被调 3 次并采纳（不补投） ----
+    _idc_env()
+    _c13 = []
+    A.run_runtime_info = _idc_stub(_c13)
+    _i13 = A.native_machine_identity("cn", "v13")
+    check("#48-13 表决·**3/3 一致时不补投**（延迟有界：11s 档）→ 组件恰好被调 3 次并采纳",
+          len(_c13) == 3 and _i13.get("machineToken") == "tok-1", (len(_c13), _i13))
+
+    # ---- 14 表决：含分歧 → 采纳多数派【完整样本】(自适应实现会补投到 5 次) ----
+    _idc_env()
+    _maj14 = {"machineToken": "tok-maj", "machineType": "ty-maj", "machineCode": "co-maj",
+              "vmInfo": {"isVm": True, "brand": "KVM", "vmTypeCode": 13}}
+    _min14 = {"machineToken": "tok-min", "machineType": "ty-min", "machineCode": "co-min",
+              "vmInfo": {"isVm": True, "brand": "Docker", "vmTypeCode": 50}}
+    _c14 = []
+    A.run_runtime_info = _idc_stub(_c14, seq=[_maj14, _maj14, _min14, _min14, _maj14])
+    _i14 = A.native_machine_identity("cn", "v14")
+    _vm14 = _i14.get("vm_info") or {}
+    check("#48-14 表决·前 3 轮有分歧 → **补投到 5 次**，采纳多数派**完整样本**"
+          "（type/code/vmInfo 自洽不杂交）",
+          _i14.get("machineToken") == "tok-maj"
+          and _i14.get("machineType") == "ty-maj"
+          and _i14.get("machineCode") == "co-maj"
+          and _vm14.get("brand") == "KVM" and _vm14.get("vmTypeCode") == 13
+          and len(_c14) == 5, (len(_c14), _i14, _c14))
+
+    # ---- 15 表决：全分歧 → 取首个样本（确定性） ----
+    _idc_env()
+    _s15 = [{"machineToken": "t-a", "machineType": "ty-a", "machineCode": "co-a",
+             "vmInfo": {"isVm": True, "brand": "KVM", "vmTypeCode": 13}},
+            {"machineToken": "t-b", "machineType": "ty-b", "machineCode": "co-b",
+             "vmInfo": {"isVm": True, "brand": "Docker", "vmTypeCode": 50}},
+            {"machineToken": "t-c", "machineType": "ty-c", "machineCode": "co-c",
+             "vmInfo": {"isVm": True, "brand": "Xen", "vmTypeCode": 7}}]
+    _c15 = []
+    A.run_runtime_info = _idc_stub(_c15, seq=_s15)
+    _i15 = A.native_machine_identity("cn", "v15")
+    check("#48-15 表决·全分歧：取**首个**样本（确定性，不杂交）",
+          _i15.get("machineToken") == "t-a" and _i15.get("machineType") == "ty-a",
+          (len(_c15), _i15))
+
+    # ---- 16 VOTE=0 → 跳过表决，只调一次 ----
+    _idc_env(QD_MACHINE_IDENTITY_VOTE="0")
+    _c16 = []
+    A.run_runtime_info = _idc_stub(_c16)
+    _i16 = A.native_machine_identity("cn", "v16")
+    check("#48-16 QD_MACHINE_IDENTITY_VOTE=0 → 跳过表决，组件只被调 1 次",
+          len(_c16) == 1 and _i16.get("machineToken") == "tok-1", (len(_c16), _i16))
+
+    # ---- 17 force → 不表决（单次） ----
+    _idc_env()
+    _c17 = []
+    A.run_runtime_info = _idc_stub(_c17)
+    _i17 = A.native_machine_identity("cn", "v17", force=True)
+    check("#48-17 force=True：不表决（单次），但仍写入两份缓存",
+          len(_c17) == 1 and _i17.get("machineToken") == "tok-1"
+          and _idc_tok(_idc_read()) == "tok-1", (len(_c17), _idc_read()))
+
+    def _s18(_tag, _brand, _type_code):
+        return {"machineToken": "tok-" + _tag, "machineType": "ty-" + _tag,
+                "machineCode": "co-" + _tag,
+                "vmInfo": {"isVm": True, "brand": _brand, "vmTypeCode": _type_code}}
+
+    # ---- 18 补投·4:1：前 3 轮分歧 → 补到 5，采纳 4 票多数派 ----
+    _idc_env()
+    _A18, _B18 = _s18("a", "KVM", 13), _s18("b", "Docker", 50)
+    _c18 = []
+    A.run_runtime_info = _idc_stub(_c18, seq=[_A18, _A18, _B18, _A18, _A18])
+    _i18 = A.native_machine_identity("cn", "v18")
+    check("#48-18 补投·4:1 → 组件被调 **5** 次、采纳 4 票的完整样本（A）",
+          len(_c18) == 5 and _i18.get("machineToken") == "tok-a"
+          and (_i18.get("vm_info") or {}).get("brand") == "KVM", (len(_c18), _i18))
+
+    # ---- 19 补投·3:2：同样补到 5，采纳 3 票多数派 ----
+    _idc_env()
+    _c19 = []
+    A.run_runtime_info = _idc_stub(_c19, seq=[_A18, _A18, _B18, _A18, _B18])
+    _i19 = A.native_machine_identity("cn", "v19")
+    check("#48-19 补投·3:2 → 组件被调 **5** 次、采纳 3 票的完整样本（A）",
+          len(_c19) == 5 and _i19.get("machineToken") == "tok-a"
+          and (_i19.get("machine_code") or _i19.get("machineCode")) == "co-a",
+          (len(_c19), _i19))
+
+    # ---- 20 补投·平票：2/2/1 无多数 → 取首个样本 ----
+    _idc_env()
+    _C20 = _s18("c", "WSL", 7)
+    _c20 = []
+    A.run_runtime_info = _idc_stub(_c20, seq=[_A18, _A18, _B18, _B18, _C20])
+    _i20 = A.native_machine_identity("cn", "v20")
+    check("#48-20 补投·平票(2/2/1) → 组件被调 **5** 次、无多数时取**首个**样本（A）",
+          len(_c20) == 5 and _i20.get("machineToken") == "tok-a"
+          and (_i20.get("vm_info") or {}).get("brand") == "KVM", (len(_c20), _i20))
+finally:
+    A.run_runtime_info = _IDC_ORIG_RUN
+    A._native_ident_cache.clear()
+    for _k in _IDC_KEYS:
+        if _IDC_ORIG_ENV[_k] is None:
+            os.environ.pop(_k, None)
+        else:
+            os.environ[_k] = _IDC_ORIG_ENV[_k]
+    _sh35.rmtree(_IDC_TMP, ignore_errors=True)
+
+print()
+print("[36] issue #20：签到结果文案分流（前端离线仿真：node 抽取 dashboard.html）")
+import shutil as _sh36
+import subprocess as _sp36
+import tempfile as _tf36
+
+_NODE36 = _sh36.which("node")
+if not _NODE36:
+    for _cand36 in (r"C:\Users\shuishui\AppData\Local\nvm\v24.19.0\node.exe",):
+        if os.path.isfile(_cand36):
+            _NODE36 = _cand36
+            break
+_DASH36 = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dashboard.html")
+_JS36 = r"""
+const fs = require('fs');
+const html = fs.readFileSync(process.env.DASH36, 'utf-8');
+const mm = html.match(/<script(?![^>]*\bsrc=)[^>]*>([\s\S]*?)<\/script>/);
+const script = mm ? mm[1] : '';
+const s = script.indexOf('function fmtNextCheckin(x){');
+const e = script.indexOf('async function doCheckin(btn){');
+let pure = (s >= 0 && e > s) ? script.slice(s, e) : '';
+const MUT = process.env.MUTATE36 === '1';
+if (MUT) {
+  pure = 'function fmtNextCheckin(x){ return ""; }'
+       + ' function checkinOutcome(x){ const nm = x.nickname || String(x.uid||"").slice(0,6) || "账号";'
+       + ' return {state:"claimed", name: nm, text: nm + ": 签到成功"}; }'
+       + ' function checkinToastKind(rows){ return "ok"; }'
+       + ' function checkinToastText(rows){ return "每日签到: 签到成功"; }';
+}
+if (!pure) { console.log(JSON.stringify({missing:true})); process.exit(0); }
+const api = new Function(pure + '\nreturn {fmtNextCheckin:fmtNextCheckin,'
+  + ' checkinOutcome:checkinOutcome, checkinToastKind:checkinToastKind,'
+  + ' checkinToastText:checkinToastText};')();
+
+const NOTE = '10-05 10:00（UTC+8）';
+const CASES = {
+  claimed_new:   {uid:'aaa111', ok:true, claimed:['每日领 100'], earned_credit:100,
+                  message:'活动领取成功 +100 Credits（每日领 100）',
+                  next_available_at:1791123600, next_available_note:NOTE},
+  idle_with_msg: {uid:'bbb222', ok:true, claimed:[], message:'今日活动奖励已领取',
+                  next_available_at:1791123600, next_available_note:NOTE},
+  idle_no_msg:   {uid:'ccc333', ok:true, claimed:[],
+                  next_available_at:1791123600, next_available_note:NOTE},
+  idle_at_only:  {uid:'eee555', ok:true, claimed:[], next_available_at:1791123600},
+  fail_msg_only: {uid:'ddd444', ok:false, error:'', message:'token 已过期，请重新登录'},
+  legacy_credit: {uid:'fff666', ok:true, earned_credit:100, msg:''},
+  legacy_none:   {uid:'ggg777', ok:true, earned_credit:0, msg:''},
+};
+// kind 的判据是「已处理 row 的 state」，因此这里必须传 checkinOutcome 的产物
+const C_OK  = api.checkinOutcome({uid:'a1', ok:true, claimed:['活动A'], message:'到账'});
+const C_IDL = api.checkinOutcome({uid:'b2', ok:true, claimed:[], message:'已领',
+                                  next_available_note:NOTE});
+const C_FAIL= api.checkinOutcome({uid:'c3', ok:false, error:'失败原因'});
+const KIND_CASES = {
+  all_claimed: [C_OK],
+  claimed_plus_idle: [C_OK, C_IDL],
+  all_idle: [C_IDL],
+  fail_plus_idle: [C_FAIL, C_IDL],
+  all_fail: [C_FAIL],
+  empty_rows: [],
+};
+const out = {pure:true, cases:{}, kinds:{}};
+for (const k of Object.keys(CASES)) out.cases[k] = api.checkinOutcome(CASES[k]);
+for (const k of Object.keys(KIND_CASES)) {
+  out.kinds[k] = {kind: api.checkinToastKind(KIND_CASES[k]),
+                  text: api.checkinToastText(KIND_CASES[k])};
+}
+console.log(JSON.stringify(out));
+"""
+if not _NODE36:
+    skip("issue #20 前端分流仿真（本机无 node）", "node not found")
+else:
+    _dir36 = _tf36.mkdtemp(prefix="qd-js36-")
+    _jsf36 = os.path.join(_dir36, "probe.js")
+    with open(_jsf36, "w", encoding="utf-8") as _fh36:
+        _fh36.write(_JS36)
+
+    def _run36_tz(tz=None, mutate=False):
+        _env36 = dict(os.environ)
+        _env36["DASH36"] = _DASH36
+        _env36["MUTATE36"] = "1" if mutate else "0"
+        if tz:
+            _env36["TZ"] = tz
+        _r36 = _sp36.run([_NODE36, _jsf36], capture_output=True, text=True,
+                         encoding="utf-8", env=_env36, timeout=60)
+        try:
+            return json.loads((_r36.stdout or "").strip().splitlines()[-1])
+        except Exception:
+            return {"missing": True,
+                    "err": ((_r36.stderr or _r36.stdout or "")[:200])}
+
+    _b36 = _run36_tz()
+    check("#52 前端：能抽到分流纯函数组（fmtNextCheckin/checkinOutcome/"
+          "checkinToastKind/checkinToastText）",
+          isinstance(_b36, dict) and _b36.get("pure") is True,
+          json.dumps(_b36, ensure_ascii=False)[:200])
+    if isinstance(_b36, dict) and _b36.get("pure"):
+        _cs36 = _b36.get("cases") or {}
+        _ks36 = _b36.get("kinds") or {}
+
+        def _txt36(_k):
+            return str((_cs36.get(_k) or {}).get("text") or "")
+
+        def _st36(_k):
+            return (_cs36.get(_k) or {}).get("state")
+
+        check("#52 前端·claimed 非空 → state=claimed 且文案含服务端 message",
+              _st36("claimed_new") == "claimed"
+              and "活动领取成功 +100 Credits" in _txt36("claimed_new"),
+              (_st36("claimed_new"), _txt36("claimed_new")[:90]))
+        check("#52 前端·claimed 空（有 message）→ **不含「签到成功」** 且带下次可签到",
+              _st36("idle_with_msg") != "claimed"
+              and "签到成功" not in _txt36("idle_with_msg")
+              and "10-05 10:00" in _txt36("idle_with_msg"),
+              (_st36("idle_with_msg"), _txt36("idle_with_msg")[:110]))
+        check("#52 前端·claimed 空（无 message）→ 兜底文案 + 下次可签到",
+              _st36("idle_no_msg") != "claimed"
+              and "签到成功" not in _txt36("idle_no_msg")
+              and "本次没有新增积分" in _txt36("idle_no_msg")
+              and "10-05 10:00" in _txt36("idle_no_msg"),
+              (_st36("idle_no_msg"), _txt36("idle_no_msg")[:110]))
+        check("#52 前端·ok=false 只有 message → state=failed、文案含 message、非 undefined",
+              _st36("fail_msg_only") == "failed"
+              and "token 已过期" in _txt36("fail_msg_only")
+              and "undefined" not in _txt36("fail_msg_only"),
+              (_st36("fail_msg_only"), _txt36("fail_msg_only")[:110]))
+        check("#52 前端·旧字段兜底（earned_credit>0、无 claimed）→ 视为到账且含 +100",
+              _st36("legacy_credit") == "claimed" and "100" in _txt36("legacy_credit"),
+              (_st36("legacy_credit"), _txt36("legacy_credit")[:90]))
+        check("#52 前端·旧字段兜底（earned_credit=0）→ 不得出现「签到成功」",
+              _st36("legacy_none") != "claimed"
+              and "签到成功" not in _txt36("legacy_none"),
+              (_st36("legacy_none"), _txt36("legacy_none")[:90]))
+        _at36 = _txt36("idle_at_only")
+        check("#52 前端·note 缺失时用 next_available_at 兜底格式化（含 UTC+8 标注）",
+              "（UTC+8）" in _at36 and "-" in _at36 and _at36 != _txt36("idle_no_msg"),
+              _at36[:110])
+        _b36u = _run36_tz("UTC")
+        _b36n = _run36_tz("America/New_York")
+        check("#52 前端·时区无关：TZ=UTC / America/New_York / 默认 三份输出逐字节一致",
+              json.dumps(_b36u, ensure_ascii=False, sort_keys=True)
+              == json.dumps(_b36n, ensure_ascii=False, sort_keys=True)
+              == json.dumps(_b36, ensure_ascii=False, sort_keys=True),
+              ((_b36u.get("cases") or {}).get("idle_at_only", {}).get("text"),
+               (_b36n.get("cases") or {}).get("idle_at_only", {}).get("text")))
+        for _k36, _want36 in (("all_claimed", "ok"), ("claimed_plus_idle", "ok"),
+                              ("all_idle", "warn"), ("fail_plus_idle", "warn"),
+                              ("all_fail", "bad"), ("empty_rows", "warn")):
+            check("#52 前端·toast kind（%s）→ %s" % (_k36, _want36),
+                  (_ks36.get(_k36) or {}).get("kind") == _want36,
+                  (_k36, (_ks36.get(_k36) or {}).get("kind")))
+        _bm36 = _run36_tz(None, mutate=True)
+        _mt36 = str(((_bm36.get("cases") or {}).get("idle_with_msg") or {}).get("text") or "")
+        check("#52 能红证据：把分流改回「ok 就写死签到成功」→ claimed 空的两条断言必红",
+              "签到成功" in _mt36, _mt36[:80])
+    else:
+        skip("issue #20 前端分流断言（抽不到纯函数组）",
+             json.dumps(_b36, ensure_ascii=False)[:140])
+    _sh36.rmtree(_dir36, ignore_errors=True)
+
+print()
+print("[37] issue #20 后端：下次可签到窗口（next_checkin_window）边界 + 时区无关")
+import datetime as _dt37
+_UTC8_37 = _dt37.timezone(_dt37.timedelta(hours=8))
+
+
+def _ep37(_y, _m, _d, _hh=10, _mm=0, _ss=0):
+    return int(_dt37.datetime(_y, _m, _d, _hh, _mm, _ss, tzinfo=_UTC8_37).timestamp())
+
+
+check("#52 后端·函数与常量存在（next_checkin_window / CHECKIN_WINDOW_HOUR_UTC8=10）",
+      callable(getattr(A, "next_checkin_window", None))
+      and getattr(A, "CHECKIN_WINDOW_HOUR_UTC8", None) == 10,
+      (callable(getattr(A, "next_checkin_window", None)),
+       getattr(A, "CHECKIN_WINDOW_HOUR_UTC8", None)))
+
+for _label37, _now37, _exp_ep37, _exp_note37 in (
+        ("09:59:59（10:00 前 1 秒）", _ep37(2026, 10, 5, 9, 59, 59),
+         _ep37(2026, 10, 5, 10, 0, 0), "10-05 10:00（UTC+8）"),
+        ("10:00:00 整点（含）", _ep37(2026, 10, 5, 10, 0, 0),
+         _ep37(2026, 10, 6, 10, 0, 0), "10-06 10:00（UTC+8）"),
+        ("10:00:01（10:00 后 1 秒）", _ep37(2026, 10, 5, 10, 0, 1),
+         _ep37(2026, 10, 6, 10, 0, 0), "10-06 10:00（UTC+8）"),
+        ("08:59:00", _ep37(2026, 10, 5, 8, 59, 0),
+         _ep37(2026, 10, 5, 10, 0, 0), "10-05 10:00（UTC+8）"),
+        ("23:59:59（当日末尾）", _ep37(2026, 10, 5, 23, 59, 59),
+         _ep37(2026, 10, 6, 10, 0, 0), "10-06 10:00（UTC+8）"),
+        ("跨月 01-31 23:59", _ep37(2026, 1, 31, 23, 59, 0),
+         _ep37(2026, 2, 1, 10, 0, 0), "02-01 10:00（UTC+8）"),
+        ("跨年 12-31 23:59", _ep37(2026, 12, 31, 23, 59, 0),
+         _ep37(2027, 1, 1, 10, 0, 0), "01-01 10:00（UTC+8）"),
+        ("月末 04-30 10:00 后", _ep37(2026, 4, 30, 10, 0, 1),
+         _ep37(2026, 5, 1, 10, 0, 0), "05-01 10:00（UTC+8）")):
+    _at37, _note37 = A.next_checkin_window(_now37)
+    check("#52 后端·边界（%s）→ at 与 note 都正确" % _label37,
+          _at37 == _exp_ep37 and _note37 == _exp_note37,
+          (_at37, _exp_ep37, _note37, _exp_note37))
+
+_at37b, _note37b = A.next_checkin_window(_ep37(2026, 10, 5, 9, 0, 0))
+_recalc37 = _dt37.datetime.fromtimestamp(_at37b, _UTC8_37).strftime("%m-%d %H:%M") + "（UTC+8）"
+check("#52 后端·at 与 note 同源（note 可由 at 反算得到，不存在两处各算一遍）",
+      _recalc37 == _note37b, (_recalc37, _note37b))
+
+_at37c, _note37c = A.next_checkin_window(1791165600 - 1)
+check("#52 后端·契约样例：next_checkin_window(1791165600-1)[1] == 10-05 10:00（UTC+8）",
+      _note37c == "10-05 10:00（UTC+8）", (_at37c, _note37c))
+
+_here37 = os.path.dirname(os.path.abspath(__file__))
+_cmd37 = ("import sys; sys.path.insert(0, %r); import qoder_accounts as A; "
+          "print(A.next_checkin_window(1791165599))" % _here37)
+
+
+def _run_tz37(_tz):
+    _env37 = dict(os.environ)
+    _env37["TZ"] = _tz
+    _env37["PYTHONIOENCODING"] = "utf-8"
+    _r37 = _sp36.run([sys.executable, "-c", _cmd37], capture_output=True,
+                     text=True, encoding="utf-8", env=_env37, timeout=60)
+    return (_r37.stdout or "").strip()
+
+
+_tz37 = {_tz: _run_tz37(_tz) for _tz in ("UTC", "America/New_York", "Asia/Shanghai")}
+check("#52 后端·时区无关：TZ=UTC / America/New_York / Asia/Shanghai 三进程输出逐字节一致",
+      len(set(_tz37.values())) == 1 and "10-05 10:00（UTC+8）" in list(_tz37.values())[0],
+      _tz37)
+
+print()
+print("SUMMARY: TOTAL %d checks, %d passed, %d failed, %d skipped"
+      % (PASS + FAIL + SKIP, PASS, FAIL, SKIP))
+print("RESULT: %s (exit %d)  SKIP=%d  |  语义: 0=GREEN(无 FAIL，允许 SKIP)；"
+      "1=RED(存在 FAIL)；SKIP 永不计入通过"
+      % ("RED" if FAIL else "GREEN", 1 if FAIL else 0, SKIP))
+# 口径自证：静态源码里以 check(/skip( 开头的顶层断言点 vs 运行时执行数。
+# 两者差值来自循环展开（多执行）与条件分支未走（少执行）；以运行时数字为准。
+try:
+    with open(os.path.abspath(__file__), encoding="utf-8") as _fh:
+        _self_src = _fh.read()
+    _static = len([_ln for _ln in _self_src.splitlines()
+                   if _ln.lstrip().startswith(("check(", "skip("))])
+    print("CHECK-SOURCES: static-top-level=%d, runtime-executed=%d, skipped=%d, "
+          "delta=%+d (循环展开/条件分支)"
+          % (_static, PASS + FAIL, SKIP, (PASS + FAIL) - _static))
+except Exception as _exc:
+    print("CHECK-SOURCES: 静态口径统计失败（%s）" % _exc)
+if SKIP:
+    print("NOTE: %d 条断言被跳过（缺 fixture/环境），没有被当成通过；"
+          "补齐后请重跑确认它们真的通过。" % SKIP)
 sys.exit(1 if FAIL else 0)

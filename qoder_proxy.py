@@ -53,7 +53,7 @@ from qoder_accounts import (get_realm_config, gateway_candidates, CLIENT_UA,
                             local_vm_status)
 from pathlib import Path
 
-VERSION = "1.1.9"
+VERSION = "1.2.17"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -607,6 +607,7 @@ def _perf_stats_uncached(sample=5000, realm=None):
         "sampled": total,
         "success": ok,
         "errors": err,
+        "inner_errors": inner_error_snapshot(),
         "success_rate_pct": round(ok * 100.0 / total, 1) if total else None,
         "ttft_ms": block(ttfts),
         "generation_ms": block(gens),
@@ -2217,6 +2218,534 @@ def parse_dsml_tool_calls(text):
 
 
 # ---------------------------------------------------------------------------
+# 历史工具调用文本形态的「回读」（issue #8）
+# ---------------------------------------------------------------------------
+# flatten_messages() 会把 assistant 历史里的 tool_calls 序列化成
+#   marker（LEAK_MARKER，见下）+ 一个 JSON 数组 [{name, arguments}, ...]
+# 给上游模型当上下文。长会话里模型偶发**照格式复述**成正文（没有结构化
+# tool_calls），客户端就会把这段 JSON 当正文显示、本轮工具调用不执行。
+# 这里补齐回读：在严格守卫下还原成结构化 tool_calls 并从正文移除。
+LEAK_MARKER = "[assistant 请求调用工具]"
+
+# issue #11：tool 角色消息被序列化进 content 时的开标记（写入侧见
+# flatten_messages）。网关只写开标记、不写闭标记；模型常自造一个
+# 「[工具结果结束]」闭标记，甚至夹带自造的 <system_warning> 残片。
+# 更根本的修法是不把 tool 结果序列化进 content（issue #11 作者建议），
+# 那属于协议层重构（需要 tool_call_id 配对与结构化 message 透传），
+# 本轮不做，只在回读侧兜住已被放大到正文里的回声块。
+TOOL_RESULT_MARKER = "[工具结果"
+TOOL_RESULT_CLOSE = "[工具结果结束]"
+
+# issue #16-B1：跨帧补全窗口 = 最长标记长度 - 1（LEAK_MARKER 18 字符 -> 17）。
+# 只有帧/缓冲**末尾**的这 17 个字符内匹配到某个标记的真前缀时才暂留；
+# 下一帧一旦证伪立即补发（fail-open），不会无限压住正常文本。
+_MARKER_HOLD_WINDOW = max(len(LEAK_MARKER), len(TOOL_RESULT_MARKER)) - 1
+
+# issue #16 兜底：hold 缓冲上限。正常文本长期"看起来仍是候选"时（模型写超长
+# JSON/正则示例），hold 会持续增长 -> 内存与首字延迟风险。超限即 fail-open
+# 放行并记一条 WARN：宁可漏一次，也不无限压住客户端。
+_HOLD_MAX_CHARS = 32768            # 32KB（真实回声块远小于此；见档案 §13）
+_HOLD_MAX_FRAMES = 200             # 极端"每帧 1 字符"场景的二级兜底
+
+
+def parse_leaked_tool_calls(text, allowed_names=None):
+    """把模型复述的「marker + JSON 数组」还原成结构化 tool_calls。
+
+    严格守卫（避免把"讨论该标记的普通回复"误判为工具调用）：
+      1) 整段正文 strip 后必须**恰好**是 marker + JSON 数组（可带 ``` 围栏）；
+      2) 数组非空，每项 name 为非空字符串、arguments 为合法 JSON（字符串或对象）；
+      3) 本次请求声明了 tools 时，所有 name 必须命中声明集合。
+
+    返回 (tool_calls|None, clean_text)：识别成功时 clean_text 为空串
+    （整段都是该块）；未识别时原样返回 text。
+    """
+    t = (text or "").strip()
+    # 整段被 ``` 围栏包裹时先剥壳（模型复述时常带围栏）
+    if t.startswith("```") and t.endswith("```") and len(t) > 6:
+        inner = t[3:]
+        if inner[:4].lower() == "json":
+            inner = inner[4:]
+        t = inner[:-3].strip()
+    if not t.startswith(LEAK_MARKER):
+        return None, text
+    rest = t[len(LEAK_MARKER):].strip()
+    if not (rest.startswith("[") and rest.endswith("]")):
+        return None, text
+    try:
+        arr = json.loads(rest)
+    except Exception:
+        return None, text
+    if not isinstance(arr, list) or not arr:
+        return None, text
+    calls = []
+    for item in arr:
+        if not isinstance(item, dict):
+            return None, text
+        name = item.get("name")
+        args = item.get("arguments")
+        if not isinstance(name, str) or not name.strip():
+            return None, text
+        if isinstance(args, (dict, list)):
+            args = json.dumps(args, ensure_ascii=False)
+        if not isinstance(args, str):
+            return None, text
+        if args.strip():
+            try:
+                json.loads(args)
+            except Exception:
+                return None, text
+        calls.append({
+            "id": _new_id("call_"),
+            "type": "function",
+            "function": {"name": name.strip(), "arguments": args},
+        })
+    if allowed_names:
+        if not all(c["function"]["name"] in allowed_names for c in calls):
+            return None, text
+    return calls, ""
+
+
+def _leak_body_offset(text):
+    """把「marker 之前的围栏前缀 / marker 之后的正文」解析出来。
+
+    返回 (state, body)：state='pre'（还处在围栏/前缀区，未到 marker）、
+    state='body'（已越过 marker，body 为其后文本）、state='no'（显然不是）。
+    流式暂存与判真共用同一套前缀规则（含 ``` 与 ```json 围栏）。
+    """
+    t = (text or "").lstrip()
+    if not t or LEAK_MARKER.startswith(t):
+        return "pre", None
+    if t.startswith(LEAK_MARKER):
+        return "body", t[len(LEAK_MARKER):]
+    if not t.startswith("`"):
+        return "no", None
+    if len(t) < 3:
+        return ("pre", None) if "```".startswith(t) else ("no", None)
+    if not t.startswith("```"):
+        return "no", None
+    rest = t[3:]
+    low = rest.lstrip().lower()
+    if low.startswith("json"):
+        after = rest.lstrip()[4:].lstrip()
+    elif LEAK_MARKER.startswith(low) or low.startswith(LEAK_MARKER):
+        after = rest.lstrip()          # 无语言标记的 ``` 围栏
+    elif "json".startswith(low):
+        return "pre", None             # 语言标记还没打完（j/js/json）
+    else:
+        return "no", None
+    if LEAK_MARKER.startswith(after):
+        return "pre", None
+    if after.startswith(LEAK_MARKER):
+        return "body", after[len(LEAK_MARKER):]
+    return "no", None
+
+
+def _leak_prefix_hold(text):
+    """文本仍可能是泄漏块的前缀？（流式 hold-back 用）"""
+    return _leak_body_offset(text)[0] != "no"
+
+
+def _tool_names_from_payload(payload):
+    """取客户端本次请求声明的工具名集合（回读守卫用）。"""
+    names = set()
+    for t in (payload or {}).get("tools") or []:
+        if not isinstance(t, dict):
+            continue
+        fn = t.get("function") if isinstance(t.get("function"), dict) else t
+        name = fn.get("name") or ""
+        if name:
+            names.add(str(name))
+    return names or None
+
+
+def _json_array_prefix_ok(text):
+    """text 是否仍可能扩展成合法 JSON 数组字面量（流式暂存判定用）。"""
+    s = (text or "").strip()
+    if not s:
+        return True
+    if not s.startswith("["):
+        return False
+    try:
+        json.loads(s)
+        return True
+    except Exception as exc:
+        msg = str(exc)
+        # 未闭合字符串的报错位置在字符串开头，但仍可继续扩展
+        if msg.startswith("Unterminated string"):
+            return True
+        pos = getattr(exc, "pos", None)
+        if pos is None:
+            return False
+        if msg.startswith("Invalid \\uXXXX escape"):
+            # issue #16-B3：截断落在未写完的转义里（"...\\u6" / "...\\u63a2"）。
+            # json.loads 的报错位置在**反斜杠**处而非末尾，旧的
+            # `pos >= len(s) - 1` 兜底会判 False -> 不吞 -> 泄漏。
+            # 「未写完」（hex 不足）与「彻底非法」（如 \\uZZZZ）在异常消息层面
+            # 无法区分，一律宽松 hold —— 流末仍会走吞掉/补发判定（parse_leaked /
+            # _leaked_partial_droppable），宽松只影响延迟、不改变最终结论。
+            # 实测（Python 3.13）：pos 指向 'u' 本身（如 s[pos-1] == "\\"）；
+            # 为稳妥两种位置都检查。
+            return (s[max(0, pos - 1):pos + 1] == "\\u"
+                    or s[pos:pos + 2] == "\\u")
+        if msg.startswith("Extra data"):
+            # 数组已完整，尾随的只能是（可能还没打完的）``` 收尾围栏
+            tail = s[pos:].strip()
+            return (not tail) or "```".startswith(tail)
+        # 语法错误点落在末尾（未闭合括号等）→ 还允许继续扩展
+        return pos >= len(s) - 1
+
+
+def _find_marker_split(text, allow_prefix=True):
+    """把正文切成 (立即发出, 暂存候选)：在首个完整标记处切开（issue #16-B1）。
+
+    - 命中完整标记 -> (标记之前的散文, 标记及其后)；
+    - allow_prefix=True 且**末尾**是某标记的真前缀（长度 < 标记）时，把这段
+      前缀留给下一帧（跨帧补全窗口 _MARKER_HOLD_WINDOW）；
+    - 无命中 -> (text, "")。
+
+    背景：服务端 delta 切分不可控，"散文 + marker" 可能落在同一帧，而
+    _leak_prefix_hold 只认「整帧以标记开头」-> 整帧被透传 -> 泄漏。
+    """
+    t = text or ""
+    if not t:
+        return "", ""
+    best = -1
+    for mk in (LEAK_MARKER, TOOL_RESULT_MARKER):
+        i = t.find(mk)
+        if i != -1 and (best == -1 or i < best):
+            best = i
+    if best != -1:
+        return t[:best], t[best:]
+    if not allow_prefix:
+        return t, ""
+    tail = t[-_MARKER_HOLD_WINDOW:] if len(t) > _MARKER_HOLD_WINDOW else t
+    for mk in (LEAK_MARKER, TOOL_RESULT_MARKER):
+        for n in range(min(len(tail), len(mk) - 1), 0, -1):
+            if tail.endswith(mk[:n]):
+                return t[:-n], t[-n:]
+    return t, ""
+
+
+def _marker_starts_at(text):
+    """text 是否以某标记开头，或整段就是它的真前缀（跨帧补全中）。"""
+    t = text or ""
+    if not t:
+        return True
+    for mk in (LEAK_MARKER, TOOL_RESULT_MARKER):
+        if t.startswith(mk):
+            return True
+        if len(t) < len(mk) and mk.startswith(t):
+            return True
+    return False
+
+
+def _still_leak_candidate(text):
+    """整段文本目前是否仍是「marker + JSON 数组」候选？（流式暂存判定用）"""
+    state, body = _leak_body_offset(text)
+    if state == "pre":
+        return True
+    if state == "no":
+        return False
+    rest = (body or "").lstrip()
+    if not rest:
+        return True
+    if rest.endswith("```"):
+        rest = rest[:-3]
+    return _json_array_prefix_ok(rest)
+
+
+def _leaked_partial_droppable(text, allowed_names=None):
+    """issue #9：正文是网关自己写入历史的工具调用回声、但被截断（JSON 不完整/
+    非法）时，应吞掉整段而不是透传给终端用户。三个条件同时成立才吞：
+      1) strip 后以 LEAK_MARKER 开头（真实散文回复几乎不会这样开头）；
+      2) 本次请求声明了 tools（allowed_names 非空）——与恢复路径同前置条件；
+      3) marker 之后（剥掉围栏后）仍是 JSON 数组字面量的前缀
+         （复用现成的 _json_array_prefix_ok）——即"本该是数组，只是没写完"。
+    返回 True = 应吞掉正文（输出空 content）。
+
+    完整且合法的 JSON 数组不算：那种情况下恢复失败另有原因（工具名未声明 /
+    arguments 非法），保持既有 fail-open 透传语义（见 _test_qoder.py 的 [27]
+    断言"未声明工具名 -> 不吞正文"），只有"数组本身没写完 / 非法"才吞。
+    """
+    if not text or not allowed_names:
+        return False
+    t = text.strip()
+    if not t:
+        return False
+    if t == LEAK_MARKER:
+        # 只有 marker、连数组都没开始写：判据 3 的退化情形，同样是回声。
+        return True
+    state, body = _leak_body_offset(t)
+    if state != "body":
+        return False
+    rest = (body or "").strip()
+    if rest.endswith("```"):
+        rest = rest[:-3].strip()
+    if not _json_array_prefix_ok(rest):
+        return False
+    try:
+        json.loads(rest)
+        return False
+    except Exception:
+        return True
+
+
+def _tool_echo_head(text):
+    """切分「[工具结果<name>]」开标记行 → (body, ok)；ok=False 表示不是合法开标记。"""
+    t = (text or "").strip()
+    if not t.startswith(TOOL_RESULT_MARKER):
+        return None, False
+    rest = t[len(TOOL_RESULT_MARKER):]
+    close = rest.find("]")
+    if close == -1 or "\n" in rest[:close]:
+        return None, False          # 标记行未闭合 / 换行后才有 ]：非本网关形态
+    return rest[close + 1:], True
+
+
+def _tool_echo_droppable(text, allowed_names=None):
+    """issue #11：正文是「[工具结果...]」回声块时吞掉整段（与 issue #9 同形态）。
+
+    三个条件同时成立才吞：
+      1) strip 后是合法开标记行（TOOL_RESULT_MARKER + 可选 name + ]）；
+      2) 本次请求声明了 tools（allowed_names 非空）——与既有回读同一前置；
+      3) 形态自洽：出现模型自造的闭标记 TOOL_RESULT_CLOSE，或标记之后（忽略空白）
+         以 JSON/标签起始字符开头（含被截断、永不闭合的块）。
+
+    为什么吞掉而不是还原成 tool 消息：还原需要把回声与历史上的 tool_call_id
+    配对（网关现在压平进 content 时并未保留 call_id），本轮不引入该复杂度，
+    只做「不把内部协议文本交给终端用户」。
+
+    不吞（fail-open）：不以标记开头；标记后跟自然语言散文；未声明 tools。
+    """
+    if not text or not allowed_names:
+        return False
+    body, ok = _tool_echo_head(text)
+    if not ok:
+        return False
+    if TOOL_RESULT_CLOSE in body:
+        return True
+    rest = body.lstrip()
+    if not rest:
+        return True                 # 只有开标记：退化形态（与 #9 的纯 marker 一致）
+    return rest[0] in "{[\"<"
+
+
+def _tool_echo_prefix_hold(text):
+    """流式 hold-back：这段缓冲仍可能是 issue #11 的回声块吗？（宽松版判据）"""
+    t = (text or "").lstrip()
+    if not t:
+        return True
+    if TOOL_RESULT_MARKER.startswith(t):
+        return True                 # 标记本身还没打完
+    body, ok = _tool_echo_head(t)
+    if not ok:
+        return False                # 不是标记形态 -> 证伪，立即放行
+    if TOOL_RESULT_CLOSE in body:
+        return True
+    rest = body.lstrip()
+    if not rest:
+        return True
+    return rest[0] in "{[\"<"
+
+
+def _echo_hold_candidate(text):
+    """统一暂存判定：仍可能是 #8 数组回声或 #11 工具结果回声？"""
+    return _still_leak_candidate(text) or _tool_echo_prefix_hold(text)
+
+
+def _leak_chunk_frame(meta, delta, finish_reason=None):
+    """按流式 chat.completion.chunk 形态合成一帧（沿用上游的 id/model）。"""
+    payload = {
+        "id": meta.get("id") or "chatcmpl-qoder",
+        "object": "chat.completion.chunk",
+        "created": meta.get("created") or int(time.time()),
+        "model": meta.get("model") or "",
+        "choices": [{"index": 0, "delta": delta,
+                     "finish_reason": finish_reason}],
+    }
+    return ("data: " + json.dumps(payload, ensure_ascii=False)
+            + "\n\n").encode("utf-8")
+
+
+def _frame_without_content(payload):
+    """复制一帧并去掉 delta.content（保留 tool_calls/reasoning/收尾信息）。"""
+    out = dict(payload)
+    choices = []
+    for ch in payload.get("choices") or []:
+        if not isinstance(ch, dict):
+            choices.append(ch)
+            continue
+        ch2 = dict(ch)
+        delta = ch2.get("delta")
+        if isinstance(delta, dict) and "content" in delta:
+            d2 = dict(delta)
+            d2.pop("content", None)
+            ch2["delta"] = d2
+        choices.append(ch2)
+    out["choices"] = choices
+    return out
+
+
+def recover_leaked_tool_calls(frames, allowed_names=None):
+    """流式回读（issue #8）：把模型逐块吐出的「marker + JSON 数组」正文恢复
+    成结构化 tool_calls 增量帧；其余内容原样透传（fail-open）。
+
+    与 parse_leaked_tool_calls 同一套严格守卫，另加：
+      - 只有当已输出的正文仍是该块的「前缀/候选」时才暂存（期间不发正文）；
+      - 候选被证伪（出现别的字 / JSON 非法）→ 立刻把暂存整段补发为正文；
+      - 收尾帧暂存到流末，识别成功时改写 finish_reason=tool_calls；
+      - 上游中断时暂存直接丢弃（正文未发，交给上游重试/错误帧处理）。
+    """
+    hold = None          # 正在暂存的候选正文（None = 未暂存）
+    hold_frames = 0      # hold 已累积的帧数（上限兜底用，issue #16）
+    finished = None      # 暂存的收尾帧：(payload, 原 finish_reason)
+    recovered = False
+    meta = {"id": None, "model": None, "created": None}
+
+    for raw in frames:
+        text = (raw.decode("utf-8", "replace")
+                if isinstance(raw, bytes) else raw)
+        data = strip_data_prefix(text)
+        payload = None
+        if data and data != "[DONE]":
+            try:
+                payload = json.loads(data)
+            except Exception:
+                payload = None
+        if not isinstance(payload, dict):
+            yield raw
+            continue
+        if payload.get("id"):
+            meta["id"] = payload["id"]
+        if payload.get("model"):
+            meta["model"] = payload["model"]
+        if payload.get("created"):
+            meta["created"] = payload["created"]
+        choices = payload.get("choices") or []
+        choice = (choices[0] if choices and isinstance(choices[0], dict)
+                  else {})
+        delta = choice.get("delta") or {}
+        piece_raw = delta.get("content")
+        piece = piece_raw if isinstance(piece_raw, str) else ""
+        fin = choice.get("finish_reason")
+        if piece_raw is not None and not isinstance(piece_raw, str):
+            # 非字符串 content（罕见）：不参与暂存判断，原样透传
+            if hold is not None:
+                yield _leak_chunk_frame(meta, {"content": hold})
+                hold = None
+                hold_frames = 0
+            yield raw
+            continue
+        if hold is not None:
+            hold += piece
+            hold_frames += 1
+            if _echo_hold_candidate(hold):
+                # issue #16 兜底：超限即 fail-open 放行（内存 + 首字延迟）。
+                if len(hold) > _HOLD_MAX_CHARS \
+                        or hold_frames > _HOLD_MAX_FRAMES:
+                    log("released oversized leak hold (%d chars / %d frames) "
+                        "— fail-open" % (len(hold), hold_frames),
+                        level="WARN", tag="chat")
+                    yield _leak_chunk_frame(meta, {"content": hold})
+                    hold = None
+                    hold_frames = 0
+                    if fin:
+                        finished = (_frame_without_content(payload), fin)
+                    continue
+                if fin:
+                    # 该帧 content 已进入 hold（可能被吞或稍后补发），收尾帧必须
+                    # 去掉 content，否则同一段内容会被发两次（issue #16）。
+                    finished = (_frame_without_content(payload), fin)
+                elif (delta.get("tool_calls")
+                      or delta.get("reasoning_content")
+                      or delta.get("role")):
+                    other = _frame_without_content(payload)
+                    yield ("data: "
+                           + json.dumps(other, ensure_ascii=False)
+                           + "\n\n").encode("utf-8")
+                continue
+            # 证伪：暂存整段补发为普通正文
+            yield _leak_chunk_frame(meta, {"content": hold})
+            hold = None
+            hold_frames = 0
+            if fin:
+                    # 该帧 content 已进入 hold（可能被吞或稍后补发），收尾帧必须
+                    # 去掉 content，否则同一段内容会被发两次（issue #16）。
+                finished = (_frame_without_content(payload), fin)
+            continue
+        if fin and not piece:
+            finished = (payload, fin)
+            continue
+        if piece:
+            # issue #16-B1：散文与 marker 落在同一帧时，_leak_prefix_hold
+            # 对整帧判 False（它要求 lstrip 后以标记开头）-> 整帧透传 -> 泄漏。
+            # 这里先按标记切分：标记之前的散文**立即发出**（不拖首字延迟），
+            # 标记及其后进既有 hold 流程；帧尾的真前缀也在这里被暂留。
+            _emit16, _hold16 = _find_marker_split(piece)
+            if _hold16:
+                if _emit16:
+                    yield _leak_chunk_frame(meta, {"content": _emit16})
+                hold = _hold16
+                hold_frames = 1
+                if fin:
+                    # 该帧 content 已进入 hold（可能被吞或稍后补发），收尾帧必须
+                    # 去掉 content，否则同一段内容会被发两次（issue #16）。
+                    finished = (_frame_without_content(payload), fin)
+                continue
+            if _leak_prefix_hold(piece) or _tool_echo_prefix_hold(piece):
+                hold = piece
+                hold_frames = 1
+                if fin:
+                    # 该帧 content 已进入 hold（可能被吞或稍后补发），收尾帧必须
+                    # 去掉 content，否则同一段内容会被发两次（issue #16）。
+                    finished = (_frame_without_content(payload), fin)
+                continue
+            if fin:
+                yield _leak_chunk_frame(meta, {"content": piece}, fin)
+            else:
+                yield _leak_chunk_frame(meta, {"content": piece})
+            continue
+        yield raw
+
+    if hold is not None:
+        calls, clean = parse_leaked_tool_calls(hold, allowed_names)
+        if calls:
+            recovered = True
+            for i, call in enumerate(calls):
+                yield _leak_chunk_frame(meta, {"tool_calls": [{
+                    "index": i,
+                    "id": call.get("id"),
+                    "type": call.get("type") or "function",
+                    "function": call.get("function") or {},
+                }]})
+            if clean:
+                yield _leak_chunk_frame(meta, {"content": clean})
+        elif _leaked_partial_droppable(hold, allowed_names):
+            # issue #9：截断的 marker+JSON 回声无法还原成结构化调用，吞掉整段，
+            # 绝不把网关内部协议文本透传给终端用户。
+            log("dropped truncated leaked tool-call echo (%d chars) — issue #9"
+                % len(hold), level="WARN", tag="chat")
+        elif _tool_echo_droppable(hold, allowed_names):
+            # issue #11：模型把 [工具结果...] 回声块当正文吐出（自造闭标记或
+            # 未闭合的截断块）——吞掉，不还原（需 tool_call_id 配对）。
+            log("dropped leaked tool-result echo (%d chars) — issue #11"
+                % len(hold), level="WARN", tag="chat")
+        else:
+            yield _leak_chunk_frame(meta, {"content": hold})
+    if finished is not None:
+        payload, fin = finished
+        if recovered:
+            payload = json.loads(json.dumps(payload))
+            for ch in payload.get("choices") or []:
+                if isinstance(ch, dict) and ch.get("finish_reason"):
+                    ch["finish_reason"] = "tool_calls"
+        yield ("data: " + json.dumps(payload, ensure_ascii=False)
+               + "\n\n").encode("utf-8")
+    elif recovered:
+        yield _leak_chunk_frame(meta, {}, "tool_calls")
+
+
+# ---------------------------------------------------------------------------
 # Qoder 数据面：请求体构造
 # ---------------------------------------------------------------------------
 def _flatten_content_text(content):
@@ -2249,14 +2778,176 @@ def _flatten_content_text(content):
     return "\n".join(t for t in texts if t), images
 
 
-def flatten_messages(messages, keep_reasoning=False):
+# ---------------------------------------------------------------------------
+# 写入侧暴露面削减（评估报告路线 3：历史工具结果首尾保留 + 中间省略）
+# ---------------------------------------------------------------------------
+# 动机（issue #8/#11）：长会话里工具结果被全文回灌、且每轮全量重放，模型反复
+# 看到同一套「信封 + 长正文」样本 -> 复述概率升高，token 成本也随轮数线性增长。
+# 这里只削减**历史**（当前轮的 tool 结果必须完整保留）：信封前缀
+# （TOOL_RESULT_MARKER + name + "]\n"）逐字节不变，只动正文。
+TOOL_RESULT_KEEP_DEFAULT = 2000        # 单侧保留字符数（默认值，可由环境覆盖）
+_TOOL_RESULT_SHRINK_MARGIN = 200       # 削后至少要省这么多字符，才值得加省略标记
+
+
+def _tool_result_keep_chars():
+    """单侧保留字符数；返回 0 表示**完全关闭**削减（回退全文回灌）。
+
+    环境变量 QD_TOOL_RESULT_KEEP：正整数 = 单侧保留字符数；
+    0 / off / none / false / no / disable[d] = 关闭；非法值 = 用默认值。
+    每次调用都读环境变量，便于运行期调整与离线测试。
+    """
+    raw = (os.environ.get("QD_TOOL_RESULT_KEEP") or "").strip().lower()
+    if not raw:
+        return TOOL_RESULT_KEEP_DEFAULT
+    if raw in ("0", "off", "none", "false", "no", "disable", "disabled"):
+        return 0
+    try:
+        val = int(raw)
+    except (TypeError, ValueError):
+        return TOOL_RESULT_KEEP_DEFAULT
+    return val if val > 0 else 0
+
+
+def _is_complete_json(text):
+    s = (text or "").strip()
+    if not s or s[0] not in "{[":
+        return False
+    try:
+        json.loads(s)
+        return True
+    except Exception:
+        return False
+
+
+def _shrink_tool_result(text, keep):
+    """历史工具结果：首尾各保留 keep 字符，中间换成明确的省略标记。
+
+    为什么首尾保留：工具输出的信息密度两端最高——头部是命令回显/首个错误/
+    文件起始，尾部是错误堆栈结尾、退出状态、diff 末尾；中间通常是重复的滚动
+    日志。按换行边界对齐，避免切出半行。
+    完整 JSON 额外宽限到 2*keep：结构化数据被截断即失去可解析性。
+    返回原文本表示「不值得削或不能削」。
+    """
+    if not isinstance(text, str) or keep <= 0:
+        return text
+    if len(text) <= keep * 2 + _TOOL_RESULT_SHRINK_MARGIN:
+        return text                       # 本来就不长：原样保留
+    if _is_complete_json(text) and len(text) <= keep * 4:
+        return text                       # 完整 JSON 给双倍预算，保住可解析性
+    head = text[:keep]
+    nl = head.rfind("\n")
+    if nl > keep // 2:                    # 尽量切在行边界（且别把头部砍太多）
+        head = head[:nl]
+    tail = text[-keep:]
+    nl2 = tail.find("\n")
+    if nl2 != -1 and nl2 < keep // 2:
+        tail = tail[nl2 + 1:]
+    omitted = len(text) - len(head) - len(tail)
+    marker = ("\n[[qoder-proxy: 已省略 %d 字符历史工具结果；"
+              "需要完整内容请重新执行该命令]]\n" % omitted)
+    return head + marker + tail
+
+
+def _current_turn_start(messages):
+    """返回「当前轮」起始下标（索引 >= 它的 tool 结果不削减）。
+
+    判定：从末尾往前找最后一条 user/system/developer 消息——它开启当前回合，
+    其后的一切（assistant 工具调用 + tool 结果）都属于当前轮。找不到则返回 0
+    （全部视为当前轮：宁可不削，也不误削模型正在用的结果）。
+    """
+    msgs = messages or []
+    for i in range(len(msgs) - 1, -1, -1):
+        m = msgs[i]
+        if isinstance(m, dict) and m.get("role") in ("user", "system",
+                                                    "developer"):
+            return i + 1
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# 结构化工具历史（task-32：tool 消息 / assistant.tool_calls 原样透传）
+# ---------------------------------------------------------------------------
+# 依据 task-31 实测（.team/tiedan.md §17）：legacy 通道在 Qwen 全系 / GLM 上
+# 接受结构化历史并被正确消费（含 3 轮链、结构化+旧文本信封混合、并行调用、
+# id 不匹配）；DeepSeek / Kimi 在 assistant.content=null 时被拒，**content=""
+# 即通过**。因此本实现恒用空字符串，绝不发 null。
+STRUCTURED_TOOL_HISTORY_WHITELIST = ("qwen", "glm", "gm4", "gm5")
+_STRUCTURED_LOG_ONCE = {"done": False}
+
+
+def _structured_mode():
+    """QD_STRUCTURED_TOOL_HISTORY 三态：'on' / 'off' / 'auto'（默认）。"""
+    raw = (os.environ.get("QD_STRUCTURED_TOOL_HISTORY") or "").strip().lower()
+    if not raw or raw == "auto":
+        return "auto"
+    if raw in ("1", "on", "true", "yes", "enable", "enabled", "force"):
+        return "on"
+    if raw in ("0", "off", "false", "no", "disable", "disabled"):
+        return "off"
+    return "auto"
+
+
+def _tool_ids_ok(messages):
+    """结构化前提：每条 tool 有 tool_call_id，每个 assistant.tool_calls 条目有 id。"""
+    for m in messages or []:
+        if not isinstance(m, dict):
+            continue
+        role = m.get("role")
+        if role == "tool":
+            if not str(m.get("tool_call_id") or "").strip():
+                return False
+        elif role == "assistant" and m.get("tool_calls"):
+            for tc in m["tool_calls"] or []:
+                if not isinstance(tc, dict) \
+                        or not str(tc.get("id") or "").strip():
+                    return False
+    return True
+
+
+def structured_tool_history_enabled(model="", model_key="", realm="",
+                                    messages=None):
+    """本次请求是否走结构化工具历史。
+
+    - off          -> False（一键回退文本化）
+    - on           -> True（显式强制：DeepSeek / Kimi / INTL 补验证用）
+    - auto（默认） -> 仅「CN 出口 + provider 白名单 + id 齐备」为真：
+        task-31 实测只在 CN / legacy 通道覆盖过（INTL 超时未取得结果），
+        故 auto 不在 INTL 启用；DeepSeek / Kimi 待补端到端验证，同样排除。
+    任何模式下 id 不齐备都回退文本化（fail-safe：宁可少用，不发畸形请求）。
+    """
+    if not _tool_ids_ok(messages):
+        return False
+    mode = _structured_mode()
+    if mode == "off":
+        return False
+    if mode == "on":
+        return True
+    if (realm or "") != "cn":
+        return False
+    for cand in (str(model_key or ""), str(model or "")):
+        low = cand.strip().lower()
+        if low and low.startswith(STRUCTURED_TOOL_HISTORY_WHITELIST):
+            if not _STRUCTURED_LOG_ONCE["done"]:
+                _STRUCTURED_LOG_ONCE["done"] = True
+                log("structured tool history: ON (model=%s key=%s realm=%s)"
+                    % (model, model_key, realm), tag="chat")
+            return True
+    return False
+
+
+def flatten_messages(messages, keep_reasoning=False, structured=False):
     """把客户端会话压平成 Qoder 上游可接受的 {role, content} 序列。
 
     返回 (system_text, flat_msgs, images)：
       - 首个 system/developer 消息抽为 system_text（模板 system 的替换源）
       - user/assistant 原位保留（content 压平为字符串）
-      - tool 结果降级为 user 消息（上游不认识 tool 角色）
-      - assistant 的 tool_calls 序列化进 content，保证上下文不丢
+      - tool 结果：structured=True 时保留 {role:"tool", tool_call_id, content}
+        （content 恒为空字符串而非 null——task-31 实测 null 会让上游转换层丢掉
+        配对的 assistant 消息，DeepSeek/Kimi 直接 provider_error）；
+        否则降级为 user 文本（上游历史上不认识 tool 角色）
+      - assistant 的 tool_calls：structured=True 时原样透传
+        （id/type/function，arguments 统一为 JSON 字符串）；
+        否则序列化进 content（LEAK_MARKER + JSON 数组）
       - assistant 的 reasoning_content 仅在 keep_reasoning=True（DeepSeek 族）
         时保留：这族模型的多轮一致性与该字段绑定，其它模型不带（避免上游
         因未知字段拒答）。此前 flatten 无条件丢弃该字段，使
@@ -2264,7 +2955,10 @@ def flatten_messages(messages, keep_reasoning=False):
     """
     system_text = None
     flat, images = [], []
-    for m in messages or []:
+    # 暴露面削减只作用于历史（当前轮的 tool 结果必须完整保留）。
+    _keep = _tool_result_keep_chars()
+    _cur_start = _current_turn_start(messages) if _keep else len(messages or [])
+    for _idx, m in enumerate(messages or []):
         if not isinstance(m, dict):
             continue
         role = m.get("role")
@@ -2280,17 +2974,52 @@ def flatten_messages(messages, keep_reasoning=False):
             tc = m.get("name") or ""
             if tc:
                 name = " (%s)" % tc
+            body = text or ""
+            if _keep and _idx < _cur_start:
+                body = _shrink_tool_result(body, _keep)
+            if structured:
+                # 结构化直传：保留 tool 角色与配对 id；content 用空字符串而非
+                # null（task-31：null 会让上游丢掉配对的 assistant 消息）。
+                flat.append({"role": "tool",
+                             "tool_call_id": str(m.get("tool_call_id") or ""),
+                             "content": body})
+                continue
             flat.append({"role": "user",
-                         "content": "[工具结果%s]\n%s" % (name, text or "")})
+                         # 前缀逐字节不变（TOOL_RESULT_MARKER + name + "]\n"）；
+                         # 削减只发生在正文部分。
+                         "content": TOOL_RESULT_MARKER + name + "]\n" + body})
             continue
         if role == "assistant" and m.get("tool_calls"):
+            if structured:
+                # 结构化直传：保 id/type/function；content 恒为空字符串。
+                # arguments 统一成 JSON 字符串（OpenAI 规范形态；dict 会被
+                # 客户端/上游两侧的转换层按字符串处理，字符串最稳）。
+                calls = []
+                for tc in m["tool_calls"]:
+                    tc = tc if isinstance(tc, dict) else {}
+                    fn = tc.get("function") or {}
+                    args = fn.get("arguments")
+                    if isinstance(args, (dict, list)):
+                        args = json.dumps(args, ensure_ascii=False)
+                    elif not isinstance(args, str):
+                        args = "" if args is None else str(args)
+                    calls.append({"id": str(tc.get("id") or ""),
+                                  "type": tc.get("type") or "function",
+                                  "function": {"name": fn.get("name") or "",
+                                               "arguments": args}})
+                item = {"role": "assistant", "content": text or "",
+                        "tool_calls": calls}
+                if keep_reasoning and m.get("reasoning_content") is not None:
+                    item["reasoning_content"] = m.get("reasoning_content") or ""
+                flat.append(item)
+                continue
             calls = []
             for tc in m["tool_calls"]:
                 fn = (tc or {}).get("function") or {}
                 calls.append({"name": fn.get("name") or "",
                               "arguments": fn.get("arguments") or ""})
             if calls:
-                text = (text or "") + "\n\n[assistant 请求调用工具]\n" + \
+                text = (text or "") + "\n\n" + LEAK_MARKER + "\n" + \
                     json.dumps(calls, ensure_ascii=False)
             item = {"role": "assistant", "content": text or ""}
             if keep_reasoning and m.get("reasoning_content") is not None:
@@ -2322,8 +3051,11 @@ def build_qoder_body(payload, account, model_key, realm=None):
     model = payload.get("model") or ""
     messages = backfill_reasoning_content(messages, model, model_key)
 
+    use_structured = structured_tool_history_enabled(
+        model=model, model_key=model_key, realm=r, messages=messages)
     system_text, flat, images = flatten_messages(
-        messages, keep_reasoning=is_deepseek_model(model, model_key))
+        messages, keep_reasoning=is_deepseek_model(model, model_key),
+        structured=use_structured)
     # 模板只保留 system 基座（其自带的示例 user 轮次是样例内容，必须丢弃），
     # 真实会话随后追加。
     tmpl_system = [m for m in (body.get("messages") or [])
@@ -2536,6 +3268,7 @@ def extract_session_key(headers, payload):
 # 上游瞬时故障（与客户端参数无关，值得同账号快速重试）
 TRANSIENT_HTTP_CODES = (418, 500, 502, 503, 504)
 TRANSIENT_MAX_RETRIES = 2          # 同账号额外重试次数（1s、2s 退避）
+CHECKIN_MIN_GAP = 1.0              # 签到防风控：账号之间的最小间隔（秒）
 _CLIENT_FAULT_MARKERS = (
     "invalid_parameter_error",     # 如 Range of max_tokens 校验失败
     "invalid_request_error",
@@ -2712,7 +3445,8 @@ def aggregate_with_envelope_retry(resp, payload, session_key, realm, model,
     try:
         for attempt in range(TRANSIENT_MAX_RETRIES + 1):
             try:
-                obj = aggregate_stream(cur, model, None, holder=holder)
+                obj = aggregate_stream(cur, model, None, holder=holder,
+                                       allowed_names=_tool_names_from_payload(payload))
                 return obj, account
             except UpstreamStatus as exc:
                 _handle_envelope_account_cooldown(account, exc, model=model, session_key=session_key)
@@ -3080,6 +3814,83 @@ def sse_with_heartbeat(source, send, interval=None, idle_limit=None):
         yield item
 
 
+# ---------------------------------------------------------------------------
+# 上游内层错误可观测性（task-34）
+# ---------------------------------------------------------------------------
+# 形态：HTTP 200 + 信封 statusCodeValue=200，但**内层 chunk** 里带 error
+# （如 provider_error → invalid_request_error："Messages with role 'tool'
+# must be a response to a preceding message with 'tool_calls'"）。
+# 既有路径对此完全无感：客户端只看到 200 的空正文，排障成本极高。
+# 本段只做计数 + 按类别首次告警，**绝不改行为**（不吞、不改映射、不改重试）。
+_INNER_ERR_LOCK = threading.Lock()
+_INNER_ERR_STATS = {"total": 0, "kinds": {}, "warned": set()}
+
+
+def inner_error_snapshot():
+    """内层错误计数快照（挂到 /usage/perf 等运行信息输出）。"""
+    with _INNER_ERR_LOCK:
+        return {"total": _INNER_ERR_STATS["total"],
+                "kinds": dict(_INNER_ERR_STATS["kinds"]),
+                "warned": sorted(_INNER_ERR_STATS["warned"])}
+
+
+def _inner_error_kind(code, message):
+    """把内层错误归类（用于首次告警去重）。返回 "" = 不是错误形态。"""
+    low = ("%s %s" % (code or "", message or "")).lower().strip()
+    if not low:
+        return ""
+    if any(k in low for k in ("datainspectionfailed", "inappropriate content",
+                              "contentfilter", "sensitivecontent",
+                              "data_inspection")):
+        return "content_policy"
+    if any(k in low for k in ("rate_limit", "throttl", "frequency limit",
+                              "10605", "too many")):
+        return "rate_limit"
+    if any(k in low for k in ("invalid_request", "invalid_parameter",
+                              "provider_error", "not found",
+                              "must be a response", "unsupported")):
+        return "invalid_request"
+    if any(k in low for k in ("unauthor", "forbidden", "permission",
+                              "expired", "token")):
+        return "auth"
+    return "other"
+
+
+def note_inner_upstream_error(obj, status=None):
+    """检测内层 chunk 的错误指示：计数 + 按类别首次 WARN。返回命中类别。
+
+    只观测、不改行为：调用点不做任何分支，yield 与清洗流程原样继续。
+    """
+    if not isinstance(obj, dict):
+        return ""
+    err = obj.get("error")
+    if isinstance(err, dict):
+        code = err.get("code") or err.get("type") or ""
+        msg = err.get("message") or ""
+    elif isinstance(err, str):
+        code, msg = "", err
+    else:
+        return ""
+    kind = _inner_error_kind(code, msg)
+    if not kind:
+        return ""
+    with _INNER_ERR_LOCK:
+        _INNER_ERR_STATS["total"] += 1
+        kinds = _INNER_ERR_STATS["kinds"]
+        kinds[kind] = kinds.get(kind, 0) + 1
+        total = _INNER_ERR_STATS["total"]
+        first = kind not in _INNER_ERR_STATS["warned"]
+        if first:
+            _INNER_ERR_STATS["warned"].add(kind)
+    if first:
+        log("upstream error hidden in HTTP 200 envelope: kind=%s status=%s "
+            "code=%s total=%d | %s"
+            % (kind, status, str(code)[:40], total,
+               ("%s %s" % (code, msg)).strip()[:300]),
+            level="WARN", tag="chat")
+    return kind
+
+
 def iter_inner_sse(resp, holder=None):
     """把上游 SSE 信封流解包成标准 OpenAI chunk 的 "data: ..." 行。
 
@@ -3123,6 +3934,9 @@ def iter_inner_sse(resp, holder=None):
             inner = json.loads(body)
         except Exception:
             continue
+        if isinstance(inner, dict):
+            # task-34：只观测（计数 + 首次告警），不影响下面的清洗/透传分支。
+            note_inner_upstream_error(inner, status=status)
         if holder is not None and inner.get("usage") and not holder.get("usage"):
             holder["usage"] = inner["usage"]
         cleaned = clean_chunk(body)
@@ -3131,8 +3945,12 @@ def iter_inner_sse(resp, holder=None):
         yield ("data: " + cleaned + "\n\n").encode("utf-8")
 
 
-def aggregate_stream(resp, model, resp_id=None, holder=None):
-    """把上游信封流折叠成一个非流式 chat.completion 对象。"""
+def aggregate_stream(resp, model, resp_id=None, holder=None, allowed_names=None):
+    """把上游信封流折叠成一个非流式 chat.completion 对象。
+
+    allowed_names：本次请求声明的工具名集合；用于「泄漏文本回读」的守卫
+    （见 parse_leaked_tool_calls / issue #8）。
+    """
     content, reasoning, finish = [], [], "stop"
     tool_calls_map = {}
     usage = holder.get("usage") if holder else None
@@ -3163,7 +3981,16 @@ def aggregate_stream(resp, model, resp_id=None, holder=None):
         for choice in chunk.get("choices") or []:
             delta = choice.get("delta") or {}
             if delta.get("content"):
-                content.append(delta["content"])
+                _c = delta["content"]
+                if isinstance(_c, str):
+                    content.append(_c)
+                elif isinstance(_c, list):
+                    for _p in _c:
+                        if isinstance(_p, str):
+                            content.append(_p)
+                        elif (isinstance(_p, dict)
+                              and isinstance(_p.get("text"), str)):
+                            content.append(_p["text"])
             if delta.get("reasoning_content"):
                 reasoning.append(delta["reasoning_content"])
             for tc in delta.get("tool_calls") or []:
@@ -3212,6 +4039,30 @@ def aggregate_stream(resp, model, resp_id=None, holder=None):
     message = {"role": "assistant", "content": "".join(content)}
     if reasoning:
         message["reasoning_content"] = "".join(reasoning)
+    # 回读（issue #8）：上游未给结构化 tool_calls，但正文恰好是网关自己写入
+    # 历史的「LEAK_MARKER + JSON 数组」形态（模型照格式复述）——还原为结构化
+    # 调用并从正文移除，避免客户端把 JSON 当正文显示、本轮调用不执行。
+    if not tool_calls_map and message.get("content"):
+        # issue #16-B1（非流式侧）：正文可能是「散文 + 回声块」。先按标记切分，
+        # 散文照常保留，只对标记起的那一段做回读/吞掉判定。
+        _head16, _block16 = _find_marker_split(message["content"],
+                                               allow_prefix=False)
+        _echo_src = _block16 or ""
+        if _echo_src:
+            _rec, _clean = parse_leaked_tool_calls(_echo_src, allowed_names)
+            if _rec:
+                message["content"] = _head16 + (_clean or "")
+                tool_calls_map = {i: c for i, c in enumerate(_rec)}
+            elif _leaked_partial_droppable(_echo_src, allowed_names):
+                # issue #9：截断的 marker+JSON 回声不还原、也不透传。
+                log("dropped truncated leaked tool-call echo (%d chars) — issue #9"
+                    % len(_echo_src), level="WARN", tag="chat")
+                message["content"] = _head16
+            elif _tool_echo_droppable(_echo_src, allowed_names):
+                # issue #11：工具结果回声块同样不还原、不透传。
+                log("dropped leaked tool-result echo (%d chars) — issue #11"
+                    % len(_echo_src), level="WARN", tag="chat")
+                message["content"] = _head16
     # 二次防御：剔除「无函数名」的空 tool_call，防止客户端死等
     if tool_calls_map:
         tool_calls_map = {k: v for k, v in tool_calls_map.items()
@@ -3674,7 +4525,11 @@ def stream_responses_events(inner_lines, model, holder):
     """
     resp_id, msg_id, rs_id = _new_id("resp_"), _new_id("msg_"), _new_id("rs_")
     created = int(time.time())
-    seq = 0
+    # 上游重开后本生成器会被重建：若 seq 从 0 重来，客户端看到的
+    # sequence_number 会回退。从 holder 恢复历史最大号，保证严格单调。
+    seq = int(holder.get("seq") or 0) if isinstance(holder, dict) else 0
+    if isinstance(holder, dict):
+        holder["resp_id"] = resp_id
     text_parts, reason_parts = [], []
     outputs = []
     reason_index = None
@@ -3708,6 +4563,8 @@ def stream_responses_events(inner_lines, model, holder):
     def ev(etype, payload_obj):
         nonlocal seq
         seq += 1
+        if isinstance(holder, dict):
+            holder["seq"] = seq        # 供外层补发终态事件时续号
         data = {"type": etype, "sequence_number": seq}
         data.update(payload_obj)
         body = json.dumps(data, ensure_ascii=False)
@@ -3849,7 +4706,23 @@ def stream_responses_events(inner_lines, model, holder):
                     })
                 # DSML 缓冲：不把原始 DSML 标签流给客户端
                 text_buffer += piece
-                while text_buffer:
+                # issue #16-B1：散文与 marker 同帧 -> 先把 marker 之前的散文
+                # 发出（不拖字），marker 起留在缓冲里等流末判定。
+                # 含 "<" 的散文不走这条捷径（交给下面的 DSML 剥离逻辑）。
+                _emit16, _hold16 = _find_marker_split(text_buffer)
+                if _hold16 and _emit16 and "<" not in _emit16:
+                    text_parts.append(_emit16)
+                    yield ev("response.output_text.delta", {
+                        "item_id": msg_id, "output_index": msg_index,
+                        "content_index": 0, "delta": _emit16,
+                    })
+                    text_buffer = _hold16
+                # 泄漏回读（issue #8）：缓冲本身是标记/候选时先压住，流末统一判定。
+                _leak_defer = _marker_starts_at(text_buffer) or (
+                    not any(text_parts) and (
+                        _leak_prefix_hold(text_buffer)
+                        or _tool_echo_prefix_hold(text_buffer)))
+                while text_buffer and not _leak_defer:
                     idx = text_buffer.find("<")
                     if idx == -1:
                         text_parts.append(text_buffer)
@@ -3958,7 +4831,39 @@ def stream_responses_events(inner_lines, model, holder):
                  {"output_index": entry["output_index"], "item": fc_item})
     # 冲刷剩余缓冲文本
     if text_buffer:
-        calls_rem, clean_rem = parse_dsml_tool_calls(text_buffer)
+        leak_calls, leak_clean = (None, text_buffer)
+        dropped_leak = False
+        dropped_tool_echo = False
+        # issue #16-B1：散文已先发出时 any(text_parts) 为真，但缓冲本身若以
+        # 标记开头（切分后剩下的回声块）仍必须走回读/吞掉判定，否则会漏。
+        if not any(text_parts) or _marker_starts_at(text_buffer):
+            leak_calls, leak_clean = parse_leaked_tool_calls(
+                text_buffer, holder.get("allowed_names"))
+            if leak_calls is None and _leaked_partial_droppable(
+                    text_buffer, holder.get("allowed_names")):
+                dropped_leak = True
+            elif leak_calls is None and _tool_echo_droppable(
+                    text_buffer, holder.get("allowed_names")):
+                dropped_tool_echo = True
+        if leak_calls:
+            dsml_tool_calls.extend(
+                {"id": c.get("id"),
+                 "name": (c.get("function") or {}).get("name") or "",
+                 "arguments": (c.get("function") or {}).get("arguments") or "{}"}
+                for c in leak_calls)
+            calls_rem, clean_rem = None, leak_clean
+        elif dropped_leak:
+            # issue #9：截断的 marker+JSON 回声 -> 不输出文本、不走 DSML 回退。
+            log("dropped truncated leaked tool-call echo (%d chars) — issue #9"
+                % len(text_buffer), level="WARN", tag="chat")
+            calls_rem, clean_rem = None, None
+        elif dropped_tool_echo:
+            # issue #11：工具结果回声块 -> 同样吞掉，不走 DSML 回退。
+            log("dropped leaked tool-result echo (%d chars) — issue #11"
+                % len(text_buffer), level="WARN", tag="chat")
+            calls_rem, clean_rem = None, None
+        else:
+            calls_rem, clean_rem = parse_dsml_tool_calls(text_buffer)
         if calls_rem:
             dsml_tool_calls.extend(calls_rem)
         if clean_rem:
@@ -4041,6 +4946,28 @@ def stream_responses_events(inner_lines, model, holder):
     if finish == "length":
         final["incomplete_details"] = {"reason": "max_output_tokens"}
     yield ev("response.completed", {"response": final})
+
+
+def _responses_failed_frame(holder, code, message):
+    """Responses 流的终态失败事件（response.failed）。
+
+    stream_responses_events 的 ev() 闭包把最新 sequence_number 同步进
+    holder["seq"]，这里在其上 +1 续号，保证严格大于已发出的事件——
+    Responses 客户端只认终态事件，缺了它会一直等（原实现只 _sse_end）。
+    """
+    seq = int((holder or {}).get("seq") or 0) + 1
+    data = {
+        "type": "response.failed",
+        "sequence_number": seq,
+        "response": {
+            "id": (holder or {}).get("resp_id") or _new_id("resp_"),
+            "object": "response",
+            "status": "failed",
+            "error": {"code": str(code), "message": message},
+        },
+    }
+    return ("event: response.failed\ndata: "
+            + json.dumps(data, ensure_ascii=False) + "\n\n").encode("utf-8")
 
 
 # ---------------------------------------------------------------------------
@@ -4384,8 +5311,14 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as exc:
                 return self._error(502, str(exc))
             data = [model_entry(mid, meta) for mid, meta in entries]
+            try:
+                catalog_source = qoder_catalog.snapshot_source(req_realm)
+            except Exception as exc:   # 只读探针：失败也不能拖垮模型列表
+                catalog_source = "unknown"
+                log("catalog source probe failed: %s" % exc, level="WARN")
             return self._json(200, {"object": "list", "data": data,
-                                    "realm": req_realm or CURRENT_REALM})
+                                    "realm": req_realm or CURRENT_REALM,
+                                    "catalog_source": catalog_source})
         if path in ("/usage", "/v1/usage"):
             if not self._authorized():
                 return
@@ -4539,6 +5472,13 @@ class Handler(BaseHTTPRequestHandler):
             if not self._panel_ok():
                 return self._error(401, "panel password required",
                                    "invalid_request_error")
+            if qoder_settings.panel_password_is_default(ACCOUNTS_DIR):
+                # 默认密码 = 局域网内任何人都能登录；明文 Key 不能这样交出去。
+                return self._error(
+                    403,
+                    "面板仍在使用默认密码，局域网内任何人都能登录后读到明文 API "
+                    "Key。请先在「设置 → 面板密码」修改密码，再查看明文 Key。",
+                    "permission_error")
             wanted = (query.get("id") or [""])[0]
             for entry in configured_keys():
                 if entry.get("id") == wanted:
@@ -4839,12 +5779,23 @@ class Handler(BaseHTTPRequestHandler):
             uid = payload.get("uid")
             targets = [POOL.get(uid)] if uid else list(POOL.accounts)
             results = []
+            last_at = None
             for account in targets:
                 if account is None:
                     continue
                 if not account.enabled or not account.access_token:
-                    continue
-                res = qoder_tasks.run_checkin(account, gap=0.4, only_daily=True)
+                    continue            # 跳过的账号不占用防风控等待
+                if last_at is not None:
+                    # 账号之间保持 >= CHECKIN_MIN_GAP（与 qoder_tasks.py 声明的
+                    # >=1.0s 一致）；try/finally 让失败路径同样计时间隔。
+                    idle = CHECKIN_MIN_GAP - (time.time() - last_at)
+                    if idle > 0:
+                        time.sleep(idle)
+                try:
+                    res = qoder_tasks.run_checkin(account, gap=CHECKIN_MIN_GAP,
+                                                  only_daily=True)
+                finally:
+                    last_at = time.time()
                 results.append({
                     "uid": account.uid,
                     "nickname": account.nickname,
@@ -4853,6 +5804,15 @@ class Handler(BaseHTTPRequestHandler):
                     "msg": (res.get("logs") or [""])[-1],
                     "logs": res.get("logs") or [],
                     "credits": res.get("credits"),
+                    # issue #20：透传 qoder_tasks 的精确结论（前端一直在读
+                    # message / claimed / next_available_*，此前永远 undefined）。
+                    # 新增而非替换：msg/logs/credits 原样保留；老路径没有
+                    # 这些 key 时为 None（前端有兼容层），不编造默认值、
+                    # 也不参与签到主流程判定。
+                    "message": res.get("message"),
+                    "claimed": res.get("claimed"),
+                    "next_available_at": res.get("next_available_at"),
+                    "next_available_note": res.get("next_available_note"),
                 })
             qoder_tasks.invalidate_panel_cache()   # 写操作后失效面板短缓存
             return self._json(200, {"results": results,
@@ -5128,7 +6088,8 @@ class Handler(BaseHTTPRequestHandler):
             % (model, want_stream, len(chat_req.get("messages") or []),
                chat_req.get("reasoning_effort"),
                sorted(custom_names) or "-"))
-        holder = {"usage": None, "custom_names": custom_names}
+        holder = {"usage": None, "custom_names": custom_names,
+                  "allowed_names": _tool_names_from_payload(chat_req)}
         try:
             req_realm = self._request_realm() or CURRENT_REALM
             blocked = self._cross_realm_error(chat_req.get("model"), req_realm)
@@ -5220,8 +6181,11 @@ class Handler(BaseHTTPRequestHandler):
                                     level="WARN", tag="chat")
                                 time.sleep(attempts)
                                 try:
+                                    # 必须用转换后的 chat 请求体重开：原始
+                                    # Responses 体的会话在 input 字段里，而
+                                    # build_qoder_body 只读 messages -> 空会话。
                                     cur2, account, _ = open_upstream(
-                                        payload, session_key=session_key,
+                                        chat_req, session_key=session_key,
                                         target_realm=req_realm)
                                 except Exception as rex:
                                     log("responses reopen failed: %s"
@@ -5251,6 +6215,12 @@ class Handler(BaseHTTPRequestHandler):
                     log("responses upstream status %s: %s"
                         % (pump_exc.status, msg[:200]), level="ERROR",
                         tag="chat")
+                    # Responses 协议靠终态事件收尾：只关流会让客户端一直等。
+                    try:
+                        self._sse_write(_responses_failed_frame(
+                            holder, _to_int_status(pump_exc.status), msg))
+                    except Exception:
+                        pass
                     self._sse_end()
                     return
                 self._sse_end()
@@ -5263,7 +6233,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             try:
                 chat_obj, account = aggregate_with_envelope_retry(
-                    upstream, payload, session_key, req_realm, model,
+                    upstream, chat_req, session_key, req_realm, model,
                     holder, account)
             except UpstreamStatus as exc:
                 record_error(model, exc.status, exc.detail,
@@ -5303,8 +6273,16 @@ class Handler(BaseHTTPRequestHandler):
         )
         if not is_account_route and path not in (
                 "/v1/chat/completions", "/chat/completions",
-                "/v1/completions", "/completions",
                 "/v1/responses", "/responses"):
+            if path in ("/v1/completions", "/completions"):
+                # legacy Completions（prompt 而非 messages）本网关不实现：
+                # 明确 404 优于"接受请求却按空会话转发上游"。
+                return self._error(
+                    404,
+                    "the legacy /v1/completions API is not supported here: "
+                    "this gateway speaks Chat Completions and Responses. "
+                    "Use /v1/chat/completions with messages=[...] instead.",
+                    "invalid_request_error")
             return self._error(404, "not found", "invalid_request_error")
         if not self._authorized():
             return
@@ -5387,7 +6365,9 @@ class Handler(BaseHTTPRequestHandler):
                     while True:
                         try:
                             for line in sse_with_heartbeat(
-                                    iter_inner_sse(cur, holder=holder),
+                                    recover_leaked_tool_calls(
+                                        iter_inner_sse(cur, holder=holder),
+                                        allowed_names=_tool_names_from_payload(payload)),
                                     self._sse_write):
                                 if first_ms is None:
                                     first_ms = int((time.time() - t_start) * 1000)
@@ -5608,6 +6588,11 @@ def main():
     elif qoder_settings.panel_password_is_default(ACCOUNTS_DIR):
         log("panel      : password is still the default 'admin' - change it "
             "in the panel")
+        if args.host == "0.0.0.0":
+            log("SECURITY   : LAN mode + default panel password 'admin' - "
+                "anyone on this network can log in and read your API key. "
+                "Change it in the panel, or restart with --panel-password.",
+                level="WARN")
 
     POOL = qoder_accounts.AccountPool(ACCOUNTS_DIR, log=log)
     POOL.load()

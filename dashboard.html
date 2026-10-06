@@ -154,9 +154,6 @@ a:hover{text-decoration:underline}
 .realm-badge-intl{color:#0369a1;background:rgba(2,132,199,.12);border:1px solid rgba(2,132,199,.3);padding:2px 9px;border-radius:999px;font-size:11px;font-weight:600}
 .realm-badge-cn{color:#b91c1c;background:rgba(220,38,38,.12);border:1px solid rgba(220,38,38,.3);padding:2px 9px;border-radius:999px;font-size:11px;font-weight:600}
 .badge-effort{display:inline-block;padding:2px 8px;border-radius:999px;font-size:11px;line-height:1.4;white-space:nowrap;margin:1px 2px;background:rgba(124,58,237,.12);color:var(--think);border:1px solid rgba(124,58,237,.3);font-weight:600}
-.realm-filter{display:inline-flex;gap:6px;margin-left:8px}
-.realm-filter button{background:var(--panel2);border:1px solid var(--line);color:var(--dim);padding:3px 9px;font-size:11px}
-.realm-filter button.active{border-color:var(--accent);color:var(--accent);background:#fff}
 
 .realm-card{
   background:var(--panel);border:1px solid var(--line);border-radius:12px;
@@ -508,6 +505,25 @@ a:hover{text-decoration:underline}
     </div>
 
     <!-- 表格 1：各账号用量透视与各模型消耗明细 -->
+    <section>
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px">
+        <h2 style="margin:0">各账号用量透视 <em id="analyticsAcctCount"></em></h2>
+        <div style="font-size:12px;color:var(--dim)">按账号维度汇总请求与 Token；末列为该账号各模型的消耗明细</div>
+      </div>
+      <div class="table-wrap"><table>
+        <thead>
+          <tr>
+            <th style="text-align:left">账号</th>
+            <th style="text-align:center;width:88px">区域</th>
+            <th style="text-align:center;width:160px">积分</th>
+            <th style="width:90px">请求数</th>
+            <th style="width:120px">总 Token</th>
+            <th style="text-align:left">模型消耗明细</th>
+          </tr>
+        </thead>
+        <tbody id="analyticsAccountTbody"></tbody>
+      </table></div>
+    </section>
     
 
     <!-- 表格 2：模型用量透视与响应指标 -->
@@ -923,7 +939,6 @@ async function pollLogin(){
 
 window.ACTIVE_GATEWAY_REALM = "intl";
 window.VIEW_REALM = "intl";
-window.REALM_FILTER = "all";
 window.MODELS_DATA = [];
 window.ACCOUNTS = [];
 
@@ -1089,7 +1104,7 @@ async function toggleActiveGatewayRealm(){
     await loadModels();
     await refresh();
   }catch(e){
-    alert("切换失败: " + e.message);
+    toast("切换失败: " + e.message, "bad");
   }
 };
 
@@ -1539,7 +1554,7 @@ async function runGrowthTasks(btn){
     toast("全部福利领取完成" + sumC + (proMsg ? ('；Pro: ' + proMsg.slice(0, 60)) : '') + "！");
   }catch(e){
     if(logBox) logBox.innerHTML += '<div style="color:var(--warn)">执行出错: ' + esc(e.message) + '</div>';
-    alert("任务执行失败: " + e.message);
+    toast("任务执行失败: " + e.message, "bad");
   }finally{
     btn.disabled = false;
     btn.textContent = oldText;
@@ -1610,13 +1625,88 @@ async function toggleScheduler(btn){
     if(btn){ btn.disabled = false; }
   }
 }
-function filterRealm(m){
-  REALM_FILTER = m;
-  document.getElementById("fltAll").className = m === "all" ? "active" : "";
-  document.getElementById("fltIntl").className = m === "intl" ? "active" : "";
-  document.getElementById("fltCn").className = m === "cn" ? "active" : "";
-  renderAccounts();
+
+// 下次可签到时间：优先后端已格式化好的 UTC+8 note；缺失时用 epoch 秒兜底换算，
+// 读数一律走 getUTC*，避免受浏览器本地时区影响。
+function fmtNextCheckin(x){
+  if(x.next_available_note) return String(x.next_available_note);
+  const sec = Number(x.next_available_at || 0);
+  if(!sec) return '';
+  const d = new Date(sec * 1000 + 8 * 3600 * 1000);
+  const p = n => String(n).padStart(2, '0');
+  return p(d.getUTCMonth() + 1) + '-' + p(d.getUTCDate()) + ' ' + p(d.getUTCHours()) + ':' + p(d.getUTCMinutes()) + '（UTC+8）';
 }
+
+// 旧版 HTTP 响应没有结论字段，只有 logs 数组；其中带固定前缀的行才是结论
+// （✓ 领取成功 / ⚠ 同人已领取 / — 状态说明 / ! 查询失败 / ⏳ 名额发完 / 🔒 需做任务），
+// 而首行「开始为账号…」与末行「  当前额度余额: N」都不是结论——直接取 logs 末行会拿到余额行。
+// 这里挑第一条结论行，并剥掉「标记 + [账号]」前缀，交给上层当文案。
+const CHECKIN_PRIMARY_RE = /^\s*(?:[✓⚠!—])/;   // 主结论：领取成功 / 同人已领 / 状态说明 / 查询失败
+const CHECKIN_AUX_RE = /^\s*(?:⏳|🔒)/;         // 附带说明：名额已发完 / 需先做新手任务
+const CHECKIN_PREFIX_RE = /^\s*(?:[✓⚠!—⏳]|🔒)\s*(?:\[[^\]]*\]\s*)?/;
+const checkinStripLine = s => s.replace(CHECKIN_PREFIX_RE, '').trim();
+function checkinLogLine(x){
+  const logs = (Array.isArray(x.logs) ? x.logs : []).filter(s => typeof s === 'string' && s.trim());
+  const pick = re => { const hit = logs.find(s => re.test(s)); return hit ? checkinStripLine(hit) : ''; };
+  const tail = logs.slice().reverse().find(s => !/^\s*开始为账号/.test(s) && !/当前额度余额/.test(s));
+  return pick(CHECKIN_PRIMARY_RE) || pick(CHECKIN_AUX_RE) || (tail ? tail.trim() : '');
+}
+// 附带说明（如「今日名额已发完，次日 10:00 后自动重试」）：旧后端没有 message，靠它解释「为什么没到账」
+function checkinAuxNote(x){
+  const logs = (Array.isArray(x.logs) ? x.logs : []).filter(s => typeof s === 'string' && s.trim());
+  const hit = logs.find(s => CHECKIN_AUX_RE.test(s));
+  return hit ? checkinStripLine(hit) : '';
+}
+
+// 单账号签到结论：后端 ok 只代表「这次请求没报错」，是否真的到账必须看 claimed / earned_credit。
+// 三类分开渲染，绝不把「已领取」「暂无可领」写成「签到成功」。
+function checkinOutcome(x){
+  const name = x.nickname || String(x.uid || '').slice(0, 6) || '账号';
+  // 结论文案优先级：新后端 message → 旧后端 logs 结论行 → 旧 msg（余额行不当作结论）→ 兜底合成
+  const legacyMsg = (x.msg && !/当前额度余额/.test(String(x.msg))) ? String(x.msg).trim() : '';
+  const detail = x.message || checkinLogLine(x) || legacyMsg;
+  if(x.ok === false){
+    return { state: 'failed', name: name, text: name + ': ' + (x.error || detail || '失败') };
+  }
+  const raw = x.claimed;
+  const claimedList = (Array.isArray(raw) ? raw : (typeof raw === 'string' ? [raw] : []))
+    .filter(v => typeof v === 'string' && v);
+  const earned = Number(x.earned_credit || 0);
+  if(claimedList.length || raw === true || earned > 0){
+    const text = detail || ('领取成功' + (earned > 0 ? ' +' + earned + ' 积分' : '') +
+      (claimedList.length ? '（' + claimedList.join('、') + '）' : ''));
+    return { state: 'claimed', name: name, text: name + ': ' + text };
+  }
+  const next = fmtNextCheckin(x);
+  const aux = x.message ? '' : checkinAuxNote(x);   // 旧后端：用日志里的附带说明补齐「为什么没到账」
+  return { state: 'idle', name: name,
+           text: name + ': ' + (detail || '本次没有新增积分（已领取或暂无可领取的活动）') +
+                 (aux && detail.indexOf(aux) < 0 ? '；' + aux : '') +
+                 (next ? '；下次可签到 ' + next : '') };
+}
+
+// toast 配色：只有真的到账才用绿色成功色；已领取/无可领用中性警示色；整批都失败才用错误色。
+// 判据只看 state（'claimed' / 'idle' / 'failed'），不碰 DOM，可离线断言。
+function checkinToastKind(rows){
+  if(rows.some(x => x.state === 'claimed')) return 'ok';
+  if(rows.length > 0 && rows.every(x => x.state === 'failed')) return 'bad';
+  return 'warn';
+}
+
+// toast 文案：≤2 个账号逐条列明细；更多账号改摘要（谁到账/谁已领/谁失败都点名）+ 首条明细，
+// 避免账号一多就把 toast 拉到屏幕外，同时不丢关键信息。
+function checkinToastText(rows){
+  const brief = n => (n.length > 8 ? n.slice(0, 8) + '…' : n);
+  if(rows.length <= 2) return rows.map(x => x.text).join('；');
+  const pick = s => rows.filter(x => x.state === s);
+  const claimedRows = pick('claimed'), idleRows = pick('idle'), failedRows = pick('failed');
+  const groups = [];
+  if(claimedRows.length) groups.push('到账 ' + claimedRows.length + '（' + claimedRows.map(x => brief(x.name)).join('、') + '）');
+  if(idleRows.length) groups.push('已领/无可领 ' + idleRows.length + '（' + idleRows.map(x => brief(x.name)).join('、') + '）');
+  if(failedRows.length) groups.push('失败 ' + failedRows.length + '（' + failedRows.map(x => brief(x.name)).join('、') + '）');
+  return groups.join(' · ') + '；明细 ' + rows[0].text;
+}
+
 async function doCheckin(btn){
   btn.disabled = true; const ot = btn.textContent; btn.textContent = "签到中...";
   try {
@@ -1624,8 +1714,8 @@ async function doCheckin(btn){
     const res = r.results || [];
     if(!res.length) toast("未发现可签到账号", "warn");
     else {
-      const summary = res.map(x => (x.nickname||x.uid.slice(0,6)) + ": " + (x.ok ? "签到成功" : (x.error||x.msg))).join("；");
-      toast("每日签到: " + summary, res.some(x => x.ok) ? "ok" : "warn");
+      const rows = res.map(checkinOutcome);
+      toast("每日签到: " + checkinToastText(rows), checkinToastKind(rows));
     }
     await initRealm(true);      // 保留当前视图（不再跳回网关默认区）
     await Promise.all([loadAccounts(), loadModels(), loadGrowthTasks({force:true})]);
@@ -1690,9 +1780,34 @@ function authHeaders(base){
   return h;
 }
 
+// 面板鉴权失败的统一处理：401 与 403 语义完全不同，绝不可并作一谈。
+//   401 = 面板会话无效/过期 → 弹登录遮罩（正确行为）。
+//   403 = 会话有效但被服务端策略拒绝（例如仍在使用默认密码时禁止读取明文 API Key）
+//         → 保留会话、绝不弹遮罩，把服务端 error.message 原样抛出，
+//           由调用处的 toast 展示可操作的原因。
+// 参数契约（响应流只能被消费一次，务必看清）：
+//   · 传了 parsedBody ⇒ 视为「响应流已被消费」：本函数绝不触碰 body，直接用传入对象取 error.message
+//                       （postJSON 已 await r.text()，此处若再 r.json() 会抛 body stream already read）
+//   · 未传 parsedBody ⇒ 视为「流未被消费」：403 分支由本函数 await r.json() 兜底
+//                       （getJSON / downloadExport 走这条，它们在状态判定前不读 body）
+async function throwPanelAuthError(r, parsedBody){
+  if(r.status === 401){
+    panelNeedsLogin();
+    throw new Error('unauthorized');
+  }
+  if(r.status === 403){
+    let body = parsedBody;
+    if(body === undefined){
+      try { body = await r.json(); } catch(e) { body = null; }
+    }
+    const msg = (body && body.error && body.error.message) || '服务端拒绝了该操作（403）';
+    throw new Error(msg);
+  }
+}
+
 async function getJSON(url){
   const r = await fetch(url, {cache:'no-store', headers: authHeaders()});
-  if(r.status === 401 || r.status === 403){ panelNeedsLogin(); throw new Error('unauthorized'); }
+  await throwPanelAuthError(r);
   if(!r.ok) throw new Error(r.status);
   return r.json();
 }
@@ -1702,7 +1817,7 @@ async function postJSON(url, body){
   const t = await r.text();
   let parsed = {};
   try { parsed = t ? JSON.parse(t) : {}; } catch(e) { parsed = {raw: t}; }
-  if(r.status === 401 || r.status === 403){ panelNeedsLogin(); throw new Error('unauthorized'); }
+  await throwPanelAuthError(r, parsed);   // 403 复用已解析的 body，不二次读取
   if(!r.ok) throw new Error((parsed.error && parsed.error.message) || r.status);
   return parsed;
 }
@@ -1816,7 +1931,7 @@ function renderAccounts(){
       + '<div style="color:var(--dim);font-size:13px;margin-bottom:18px">'
       +   '请先登录或导入一个 ' + viewName + ' 账号，之后相关请求都会走该账号'
       + '</div>'
-      + '<button onclick="startLogin()" style="font-size:14px;padding:10px 22px">'
+      + '<button onclick="openLoginModal()" style="font-size:14px;padding:10px 22px">'
       +   '登录新账号 (OAuth)'
       + '</button>'
       + '</div>';
@@ -2053,7 +2168,7 @@ async function downloadExport(query, fallbackLabel){
   // A plain <a href> would not carry the X-Panel-Token header, so a
   // password-only session would be rejected.
   const r = await fetch('/accounts/export' + (query || ''), {cache:'no-store', headers: authHeaders()});
-  if(r.status === 401 || r.status === 403){ panelNeedsLogin(); throw new Error('unauthorized'); }
+  await throwPanelAuthError(r);
   if(r.status === 404){
     let msg = '账号不存在';
     try{ const e = await r.json(); msg = (e.error && e.error.message) || msg; }catch(_){}
@@ -3177,6 +3292,12 @@ let logAutoScroll = true;
 let logPollTimer = null;
 let logFetching = false;
 let logUserScrolledUp = false;
+// 增量渲染游标：DOM 已渲染到 logEntries 里的哪个 id、当前过滤条件签名、已渲染行数。
+// 命中增量路径时只追加新行并从头部裁掉超限行，避免每 2s 全量重建最多 2000 行 DOM。
+let logRenderedLastId = null;
+let logRenderedKey = '';
+let logRenderedRows = 0;
+const LOG_MAX_ROWS = 2000;   // 与 logEntries 的保留上限一致
 
 function startLogPolling(){
   if(logPollTimer) clearInterval(logPollTimer);
@@ -3220,7 +3341,7 @@ async function fetchNewLogs(forceReset){
       } else if(logEntries.length > 0){
         lastLogId = logEntries[logEntries.length - 1].id;
       }
-      renderLogs();
+      renderLogs(forceReset);
       updateLogStats();
     }
     if(statusEl) statusEl.textContent = '就绪 · ' + new Date().toLocaleTimeString();
@@ -3329,39 +3450,97 @@ function escapeHtml(s){
   return String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
 
-function renderLogs(){
+function logFilterKey(){
+  return logFilterLevel + '|' + logFilterTag + '|' + logSearchText;
+}
+
+// 过滤判定与「复制」共用，保证复制内容与屏幕所见一致
+function logPassesFilter(item){
+  if(logFilterLevel && item.level !== logFilterLevel) return false;
+  if(logFilterTag && item.tag !== logFilterTag) return false;
+  if(logSearchText){
+    const haystack = ((item.msg || '') + ' ' + (item.tag || '') + ' ' + (item.time || '')).toLowerCase();
+    if(!haystack.includes(logSearchText)) return false;
+  }
+  return true;
+}
+
+function logLineHTML(item){
+  const lvlCls = 'lvl-' + (item.level || 'INFO');
+  const tagCls = 'tag-' + (item.tag || 'system');
+  return '<div class="log-line">' +
+      '<span class="log-ts">' + escapeHtml(item.time || '') + '</span>' +
+      '<span class="log-lvl ' + lvlCls + '">' + escapeHtml(item.level || 'INFO') + '</span>' +
+      '<span class="log-tag ' + tagCls + '">[' + escapeHtml(item.tag || 'system') + ']</span>' +
+      '<span class="log-msg">' + escapeHtml(item.msg || '') + '</span>' +
+    '</div>';
+}
+
+// 增量渲染：常态只追加本轮新增行，并从头部裁掉超出上限的行；仅在过滤条件变化、
+// 强制重拉（forceFull）或游标条目已不在缓冲区内时，才回退到全量重建。
+// 视觉样式、自动滚动与空态文案与原实现保持完全一致。
+function renderLogs(forceFull){
   const body = document.getElementById('logTerminalBody');
   if(!body) return;
 
-  const filtered = logEntries.filter(item => {
-    if(logFilterLevel && item.level !== logFilterLevel) return false;
-    if(logFilterTag && item.tag !== logFilterTag) return false;
-    if(logSearchText){
-      const haystack = ((item.msg || '') + ' ' + (item.tag || '') + ' ' + (item.time || '')).toLowerCase();
-      if(!haystack.includes(logSearchText)) return false;
+  const key = logFilterKey();
+  let start = 0;
+  let full = !!forceFull || key !== logRenderedKey || logRenderedLastId === null;
+  if(!full){
+    // 从尾部倒查游标（容忍重复 id），找不到说明已被裁头或整体替换 → 全量
+    let idx = -1;
+    for(let i = logEntries.length - 1; i >= 0; i--){
+      if(logEntries[i].id === logRenderedLastId){ idx = i; break; }
     }
-    return true;
-  });
+    if(idx < 0) full = true;
+    else start = idx + 1;
+  }
+  if(full){
+    body.innerHTML = '';
+    logRenderedRows = 0;
+    start = 0;
+  }
 
-  if(filtered.length === 0){
-    body.innerHTML = '<div class="log-empty">暂无匹配的日志记录</div>';
+  if(logEntries.length === 0){
+    if(!body.firstElementChild){
+      body.innerHTML = '<div class="log-empty">暂无匹配的日志记录</div>';
+    }
+    logRenderedLastId = null;
+    logRenderedKey = key;
     return;
   }
 
   const htmlParts = [];
-  filtered.forEach(item => {
-    const lvlCls = 'lvl-' + (item.level || 'INFO');
-    const tagCls = 'tag-' + (item.tag || 'system');
-    htmlParts.push(
-      '<div class="log-line">' +
-        '<span class="log-ts">' + escapeHtml(item.time || '') + '</span>' +
-        '<span class="log-lvl ' + lvlCls + '">' + escapeHtml(item.level || 'INFO') + '</span>' +
-        '<span class="log-tag ' + tagCls + '">[' + escapeHtml(item.tag || 'system') + ']</span>' +
-        '<span class="log-msg">' + escapeHtml(item.msg || '') + '</span>' +
-      '</div>'
-    );
-  });
-  body.innerHTML = htmlParts.join('');
+  for(let i = start; i < logEntries.length; i++){
+    if(logPassesFilter(logEntries[i])) htmlParts.push(logLineHTML(logEntries[i]));
+  }
+  if(htmlParts.length){
+    const ph = body.querySelector('.log-empty');
+    if(ph) ph.parentNode.removeChild(ph);
+    body.insertAdjacentHTML('beforeend', htmlParts.join(''));
+    logRenderedRows += htmlParts.length;
+  }
+
+  // 裁头：DOM 行数不超过 LOG_MAX_ROWS，等价于原来「只展示最新 2000 条」的口径
+  let trimmedHeight = 0;
+  while(logRenderedRows > LOG_MAX_ROWS && body.firstElementChild){
+    trimmedHeight += body.firstElementChild.offsetHeight;
+    body.removeChild(body.firstElementChild);
+    logRenderedRows--;
+  }
+  if(trimmedHeight && logUserScrolledUp){
+    // 用户上翻阅读历史时补偿被裁掉的高度，避免视口跳动
+    body.scrollTop = Math.max(0, body.scrollTop - trimmedHeight);
+  }
+
+  if(logRenderedRows === 0 && !body.querySelector('.log-empty')){
+    body.innerHTML = '<div class="log-empty">暂无匹配的日志记录</div>';
+  }
+
+  const lastItem = logEntries[logEntries.length - 1];
+  // 上游没给 id 时退化为全量渲染（原行为），不猜游标
+  logRenderedLastId = (lastItem && lastItem.id != null) ? lastItem.id : null;
+  logRenderedKey = key;
 
   if(logAutoScroll && !logUserScrolledUp){
     body.scrollTop = body.scrollHeight;
@@ -3369,15 +3548,8 @@ function renderLogs(){
 }
 
 function copyFilteredLogs(){
-  const filtered = logEntries.filter(item => {
-    if(logFilterLevel && item.level !== logFilterLevel) return false;
-    if(logFilterTag && item.tag !== logFilterTag) return false;
-    if(logSearchText){
-      const haystack = ((item.msg || '') + ' ' + (item.tag || '') + ' ' + (item.time || '')).toLowerCase();
-      if(!haystack.includes(logSearchText)) return false;
-    }
-    return true;
-  });
+  // 与 renderLogs 共用同一套判定，保证「复制」内容与屏幕所见一致
+  const filtered = logEntries.filter(logPassesFilter);
   const text = filtered.map(x => '[' + (x.ts || x.time) + '] [' + x.level + '] [' + x.tag + '] ' + x.msg).join('\n');
   navigator.clipboard.writeText(text).then(() => {
     toast('已复制 ' + filtered.length + ' 行日志', 'ok');

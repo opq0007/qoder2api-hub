@@ -24,6 +24,25 @@ thinking_config 思考档位、is_free/is_new/icon、strategies 等）。
 
 运行时优先级：网关动态 /algo/api/v2/model/list > 本机官方目录缓存 > 本快照。
 双区清单**不同**（intl 独占 {'efficient', 'cmodel', 'smodel', 'ultimate', 'performance'}，cn 独占 {'q37fmodel', 'gm51model'}）。
+
+三源差异（实测 · **这不是 bug，是数据源不同**）：
+  同一台机器上可能同时存在三套"官方数据"，它们的抓取时刻不同，字段取值因此
+  互不相同；网关按「动态接口 > 本机缓存 > 本快照」降级，降级到哪一级就换一套口径：
+    1) 动态接口 /algo/api/v2/model/list —— 官方"此刻"（桌面版选择器同源）
+    2) 本机缓存 ~/.qoder[.cn]/.models/<uid>/catalog-v6 —— 客户端上次联网同步时刻
+    3) 本模块 qoder_catalog_intl.json / qoder_catalog_cn.json（外部双区 JSON）；
+       文件缺失/不可读时回退本文件内嵌的**冻结副本**（更旧）并打印 WARNING
+  实测样例（2026-09-29 快照 vs 2026-10-02 客户端缓存）：
+    qmodel_38max   price_factor 内嵌 0.2 / 外部 JSON 0.5 / 本机缓存 0.2，
+                   且内嵌 promotion.active=true 而外部 JSON 为 false
+    qmodel_latest  内嵌带 promotion（0.1 折后价），本机缓存无 promotion
+    其余已观测差异字段：is_sensitive、max_input_tokens、minimal_version、
+      thinking_config 的默认档（is_default 落在 low 还是 medium）
+  影响面：qoder_proxy.model_entry 的谷时价严格由 promotion 推导
+    （price_factor_valley = before_promotion_price_factor × discount_factor），
+    所以**降级会直接改变下游看到的峰谷价**，而不是"大概差不多"。
+  观察点：降级时打印 [qoder-catalog] WARNING（既有行为，未改动）；
+    另提供只读来源标注 snapshot_source(realm) / snapshot_report()（本期新增）。
 """
 
 import json
@@ -1476,6 +1495,27 @@ _CN_JSON = r'''
 ]
 '''
 
+# ---------------------------------------------------------------------------
+# 模型快照来源标注（只读观测面 · 纯新增：不改任何既有字段与语义）
+#
+# 目的：让"当前模型数据来自哪一级源"可被观察（三源差异见模块 docstring 同名章节）。
+#   external-json   同目录 qoder_catalog_intl.json / qoder_catalog_cn.json
+#   embedded-frozen 本文件内嵌冻结副本（外部文件缺失/不可读/非非空 list）
+# 降级原因仅用于观察，不参与任何加载决策。
+# ---------------------------------------------------------------------------
+SNAPSHOT_SOURCE_EXTERNAL = "external-json"
+SNAPSHOT_SOURCE_EMBEDDED = "embedded-frozen"
+
+SNAPSHOT_DEGRADE_MISSING = "file-missing"
+SNAPSHOT_DEGRADE_UNREADABLE = "unreadable-or-invalid"
+SNAPSHOT_DEGRADE_EMPTY = "empty-or-not-list"
+
+_SNAPSHOT_FILENAMES = {"intl": "qoder_catalog_intl.json",
+                       "cn": "qoder_catalog_cn.json"}
+_SNAPSHOT_SOURCES = {}          # filename -> SNAPSHOT_SOURCE_*
+_SNAPSHOT_DEGRADE_REASONS = {}  # filename -> SNAPSHOT_DEGRADE_*
+
+
 def _load_snapshot(filename, embedded):
     """加载区域目录快照：优先同目录 JSON 文件，缺失才回退内嵌冻结副本。
 
@@ -1483,15 +1523,22 @@ def _load_snapshot(filename, embedded):
     更新后重跑一次即可），格式与内嵌副本完全一致（chat 场景逐字段原样）。
     """
     path = os.path.join(os.path.dirname(os.path.abspath(__file__)), filename)
+    reason = SNAPSHOT_DEGRADE_MISSING
     try:
         with open(path, encoding="utf-8") as fh:
             data = json.load(fh)
         if isinstance(data, list) and data:
+            _SNAPSHOT_SOURCES[filename] = SNAPSHOT_SOURCE_EXTERNAL
             return data
+        reason = SNAPSHOT_DEGRADE_EMPTY
+    except FileNotFoundError:
+        reason = SNAPSHOT_DEGRADE_MISSING
     except Exception:
-        pass
+        reason = SNAPSHOT_DEGRADE_UNREADABLE
     _warn("catalog snapshot %s missing/unreadable - falling back to the frozen "
           "built-in snapshot (may be outdated; run _refresh_catalog.py)" % filename)
+    _SNAPSHOT_SOURCES[filename] = SNAPSHOT_SOURCE_EMBEDDED
+    _SNAPSHOT_DEGRADE_REASONS[filename] = reason
     return json.loads(embedded)
 
 
@@ -1731,3 +1778,55 @@ def official_local_name(key):
         if m["key"] == key:
             return "" if lab == m.get("display_name") else lab
     return lab
+
+
+# ---------------------------------------------------------------------------
+# 只读观测面：当前快照来源（供 /v1/models 等对外接口与诊断复用）
+#
+# 纯查询接口，不改变任何既有语义。三源差异的实测数据见模块 docstring。
+# 对外接线示例（一行，由 qoder_proxy 侧负责；本模块不反向依赖它）：
+#   resp["catalog_source"] = qoder_catalog.snapshot_source(req_realm)
+# ---------------------------------------------------------------------------
+def snapshot_source(realm):
+    """该区域快照的**实际**来源（只读）。
+
+    返回 SNAPSHOT_SOURCE_EXTERNAL（外部双区 JSON）或 SNAPSHOT_SOURCE_EMBEDDED
+    （内嵌冻结副本 = 已降级，数据可能过期）。realm 非 "intl" 时按 "cn" 处理，
+    与 models_for_realm() 的默认分支保持一致。
+    """
+    fn = _SNAPSHOT_FILENAMES.get(realm) or _SNAPSHOT_FILENAMES["cn"]
+    return _SNAPSHOT_SOURCES.get(fn) or SNAPSHOT_SOURCE_EMBEDDED
+
+
+def snapshot_report():
+    """两区来源标注 + 降级原因 + 与内嵌副本的差异 key（只读诊断）。
+
+    返回 {realm: {"source", "degrade_reason", "models", "embedded_diff_keys"}}。
+    embedded_diff_keys 非空 = 外部 JSON 已与本文件内嵌副本漂移：此时若发生降级
+    （外部文件丢失/损坏），这些模型的字段会整体换一套口径（峰谷价尤其明显）。
+    注意：已降级（source=embedded-frozen）时该列表恒为空——比较对象此时就是内嵌
+    副本自身；「是否已降级」请读 source / degrade_reason 两个字段，别看这个列表。
+    """
+    out = {}
+    for realm, fn in _SNAPSHOT_FILENAMES.items():
+        embedded = json.loads(_INTL_JSON if realm == "intl" else _CN_JSON)
+        out[realm] = {
+            "source": snapshot_source(realm),
+            "degrade_reason": _SNAPSHOT_DEGRADE_REASONS.get(fn, ""),
+            "models": len(models_for_realm(realm)),
+            "embedded_diff_keys": sorted(
+                _snapshot_key_diffs(embedded, models_for_realm(realm))),
+        }
+    return out
+
+
+def _snapshot_key_diffs(embedded, loaded):
+    """两侧「key 集合差 + 同 key 任一字段不同」的 key 集合（只读）。"""
+    emb = {m.get("key"): m for m in embedded if isinstance(m, dict)}
+    cur = {m.get("key"): m for m in loaded if isinstance(m, dict)}
+    diffs = set(emb) ^ set(cur)
+    for k in set(emb) & set(cur):
+        a, b = emb[k], cur[k]
+        if any(a.get(f) != b.get(f) for f in set(a) | set(b)):
+            diffs.add(k)
+    return diffs

@@ -13,6 +13,7 @@
   - 账号导入导出（Dry-Run 预检）与 JSON 持久化（原子写）
 """
 import base64
+import datetime
 import ipaddress
 import json
 import os
@@ -129,12 +130,37 @@ def desktop_version():
 # 服务端**按这些值过滤设备定向活动**：派生的假身份不会报错，但活动列表里
 # 会静默少掉"每日领取 100 Credits"这类条目（实测：换用原生身份后立刻出现
 # CLAIMABLE 活动）。因此网关优先调用同一个官方二进制取真值，失败才回退派生值。
-# 原生身份缓存：身份会随时间轮换，但**旧身份仍被服务端接受**（实测复用 25s+
-# 依然 showCampaign=true），真正的成本是每次强制刷新要跑 3.7 秒的官方二进制。
-# 因此做长缓存（30 分钟），并用"列表被判为未认可时刷新重试一次"兜底自愈。
+# 原生身份缓存：组件的输出由**种子文件** $HOME/.config/.locale_cfg 决定——
+# 同一种子下重复调用返回同一个身份（#18 实测：69 分钟 24 次采样不变），
+# 换身份只能靠"清种子 + 重调组件"（见 _purge_identity_seed）。旧身份长期被
+# 服务端接受（实测复用 25s+ 依然 showCampaign=true），真正的成本是每次调
+# 组件要跑约 3.7 秒的官方二进制。因此做长缓存（30 分钟）+ 落盘缓存，并用
+# "列表被判为未认可时清种子换新身份重试一次"兜底自愈。
 # 注意：身份是**机器级**的（不同账号/不存在的账号 id 都返回同一份），
 # 因此按区域缓存即可，同一台机器上的多个账号共用是正确的。
 NATIVE_IDENTITY_TTL = 1800
+# 首次落盘前的**自适应**多数表决（#18 补充：组件的 VM 判定会抖到另一分支
+# KVM/13 ↔ Docker/50——报告者实测 1.56%，本机复现 10.29%；单次采样会把用户
+# 永久固定到少数派）。先投 IDENTITY_VOTE_ROUNDS 次：全一致直接采纳；出现
+# 分歧再补 IDENTITY_VOTE_EXTEND_ROUNDS 次（上限 5，首次延迟有界）。
+# 轮数按**最坏抖动率**选：10% 抖动下 3 轮误判≈2.7%，自适应到 5 轮≈0.85%。
+# 表决只在"首次无可用缓存"这一次发生；可用 QD_MACHINE_IDENTITY_VOTE=0 关闭。
+IDENTITY_VOTE_ROUNDS = 3
+IDENTITY_VOTE_EXTEND_ROUNDS = 2
+# machine_identity_source（及 campaigns().identity）的合法取值只有两种：
+#   "runtime-info" —— runtime-info.exe 原生桥给出真身份（native_machine_identity）
+#   "derived"      —— 无原生桥时的派生回退（desktop_headers）
+# 生产端一律使用本常量。历史上消费端（campaigns() 自愈条件）误写为 "native"，
+# 与生产端字面量不一致导致该分支永不命中（口径分裂 bug，已修）；"native" 仅
+# 作为历史/测试桩别名在消费端兼容，不得作为新的生产端取值。
+MACHINE_IDENTITY_NATIVE = "runtime-info"
+# desktop_headers() 本次实际是否携带 cosy-machine* 机器头（与"身份来源"
+# machine_identity_source 是两个正交维度，勿混用）：
+#   "native"  —— 本次发送了原生桥给出的全套六头
+#   "omitted" —— 本次未发送任何 cosy-machine* 头（无原生桥时的正确行为；
+#                issue #10 修复前会发派生假头，实测会被服务端整条过滤活动）
+MACHINE_HEADERS_NATIVE = "native"
+MACHINE_HEADERS_OMITTED = "omitted"
 _native_exe_cache = {}
 _native_ident_cache = {}
 
@@ -182,7 +208,13 @@ def desktop_install_dir(realm):
 
 
 def runtime_info_exe(realm):
-    """定位官方 runtime-info.exe（原生风控身份桥）；找不到返回空串。
+    """定位 runtime-info 原生风控身份桥；找不到返回空串。
+
+    查找顺序（先桌面客户端，再提取目录）：
+      1. <桌面客户端安装目录>/resources/umid/runtime-info.exe（Windows 桌面端）；
+      2. POSIX：$QD_UMID_DIR/runtime-info、<repo>/umid/runtime-info
+         （由 _install_umid.py 从 @qoder-ai/qodercli 提取；两者调用契约一致。
+          Windows 不参与此分支，保持原有桌面客户端路径逐字不变）。
 
     可用 QD_NATIVE_IDENTITY=0 关闭（测试/受限环境不希望拉起客户端二进制时）。
     """
@@ -190,23 +222,63 @@ def runtime_info_exe(realm):
         return ""
     if realm in _native_exe_cache:
         return _native_exe_cache[realm]
-    exe = ""
-    roots = [os.path.join(desktop_install_dir(realm), "resources", "umid")]
     found = ""
+    roots = [os.path.join(desktop_install_dir(realm), "resources", "umid")]
     for root in roots:
         cand = os.path.join(root, "runtime-info.exe")
         if os.path.isfile(cand):
             found = cand
             break
+    if not found and os.name == "posix":
+        # 提取目录（_install_umid.py 的落地位置；Windows 不参与本分支，
+        # 保持原有桌面客户端路径逐字不变）：显式 QD_UMID_DIR 优先于约定目录。
+        extracted = []
+        umid_dir = (os.environ.get("QD_UMID_DIR") or "").strip()
+        if umid_dir:
+            extracted.append(umid_dir)
+        extracted.append(os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "umid"))
+        for root in extracted:
+            cand = os.path.join(root, "runtime-info")
+            if os.path.isfile(cand):
+                found = cand
+                break
     _native_exe_cache[realm] = found
     return found
 
 
+# ---------------------------------------------------------------------------
+# 原生桥执行失败的一次性提示（issue #12）
+# ---------------------------------------------------------------------------
+# 「组件不存在」（runtime_info_exe 返回空串）是正常降级、保持静默；「组件在但
+# 执行失败」在子进程 exec 阶段才暴露（典型：alpine 缺 glibc loader / libstdc++，
+# 报 FileNotFoundError: /lib64/ld-linux-x86-64.so.2），过去被静默吞掉后只剩
+# 「身份退化为 derived」，最容易被误诊成路径没配好。同类失败同进程只提示一次，
+# 避免批量签到/巡检时刷屏。
+_runtime_info_warned = set()
+
+
+def _runtime_info_warn(category, message):
+    """把原生桥失败按类别提示到 stderr（同一类别进程内只打一次）。"""
+    if category in _runtime_info_warned:
+        return
+    _runtime_info_warned.add(category)
+    try:
+        import sys
+        print("[runtime-info] %s" % message, file=sys.stderr)
+    except Exception:
+        pass
+
+
 def run_runtime_info(realm, account_id=""):
-    """调用官方 runtime-info.exe，返回其 JSON（失败返回 {}）。
+    """调用 runtime-info 原生桥，返回其 JSON（失败返回 {}）。
 
     account 为空串同样可用：机器身份是机器级的，活动平台之外（如虚拟化体检）
     不需要账号上下文。
+
+    失败可见性（issue #12）：「组件不存在」（runtime_info_exe 返回空串）保持
+    静默；「组件在但执行失败」（缺 glibc loader / libstdc++、执行位丢失、输出
+    异常等）会把底层异常打一次到 stderr——两种情况都照旧返回 {} 供上层回退。
     """
     exe = runtime_info_exe(realm)
     if not exe:
@@ -221,8 +293,24 @@ def run_runtime_info(realm, account_id=""):
         out = proc.stdout.decode("utf-8", "replace").strip()
         if out:
             return json.loads(out.split("\n", 1)[0])
-    except Exception:
-        pass
+        _runtime_info_warn(
+            "empty-output",
+            "%s 运行结束但没有输出（exit=%s），身份将退化为 derived"
+            % (exe, proc.returncode))
+    except OSError as exc:
+        # 文件存在但 exec 失败：FileNotFoundError 缺的通常不是组件本身，而是它
+        # 的动态 loader（glibc 的 /lib64/ld-linux-x86-64.so.2，alpine/musl 没有）；
+        # 底层异常必须透出来，否则会被误读成「路径没配好」。
+        _runtime_info_warn(
+            "exec:" + type(exc).__name__,
+            "无法执行 %s：%s: %s（组件存在但跑不起来；Docker/alpine 需要 "
+            "gcompat libstdc++ libgcc 兼容层，见 README 已知限制）"
+            % (exe, type(exc).__name__, exc))
+    except Exception as exc:
+        # 其它失败（超时 / 输出不是 JSON / 非 OSError 异常）
+        _runtime_info_warn(
+            "run:" + type(exc).__name__,
+            "%s 调用失败：%s: %s" % (exe, type(exc).__name__, exc))
     return {}
 
 
@@ -249,33 +337,435 @@ def local_vm_status(realm=None, force=False):
     return st
 
 
+# ---------------------------------------------------------------------------
+# 机器身份落盘缓存（issue #18：Docker 重建/升级容器后设备身份不变）
+# ---------------------------------------------------------------------------
+# 组件每次调用都会给出**新**身份——所以"调用后顺便更新缓存"等于没缓存。
+# 本实现的纪律（设计 .team/00-IDENTITY-CACHE-DESIGN.md §9）：
+#   · **缓存优先**：落盘命中就不调组件（「重建不换」的唯一来源）；
+#   · 落盘只在两处写入：① 落盘没有该 realm 的可用记录（不存在 / 已按 TTL
+#     失效 / 损坏）时取到的新身份；② 自愈路径（campaigns() 被判未认可后的
+#     force 刷新）覆盖。其它路径一律不写，否则身份又会被自己刷掉。
+#   · 失败回退：组件不可用时用落盘缓存（哪怕过期）——比 derived 假身份好。
+_IDENTITY_CACHE_LOCK = threading.Lock()
+_identity_cache_reuse_logged = set()     # 「复用缓存」INFO：每个 realm 一次
+_identity_cache_corrupt_warned = False   # 「损坏/字段不全」WARN：进程内一次
+_identity_cache_diff_warned = False      # 「与组件输出不一致」INFO：进程内一次
+_identity_reset_done = False             # QD_MACHINE_IDENTITY_RESET 只消费一次
+
+
+def machine_identity_cache_path():
+    """机器身份落盘缓存路径：$ACCOUNTS_DIR/machine_identity.json（未设时用
+    <repo>/accounts/machine_identity.json，与网关的账号目录一致）。"""
+    base = (os.environ.get("ACCOUNTS_DIR") or "").strip()
+    if not base:
+        base = os.path.join(os.path.dirname(os.path.abspath(__file__)), "accounts")
+    return os.path.join(base, "machine_identity.json")
+
+
+def _identity_cache_enabled():
+    """QD_MACHINE_IDENTITY_CACHE：auto/on（默认启用）/ off（关闭＝仅内存＝旧行为）。"""
+    value = (os.environ.get("QD_MACHINE_IDENTITY_CACHE") or "auto").strip().lower()
+    return value not in ("off", "0", "false", "no", "disable", "disabled")
+
+
+def _identity_vote_enabled():
+    """QD_MACHINE_IDENTITY_VOTE：默认开启；0/off 跳过首次表决（只调一次组件）。
+
+    给"不在乎这 1~2% 抖动、想要最快首启"的用户——首启表决约需 3×组件耗时。
+    """
+    value = (os.environ.get("QD_MACHINE_IDENTITY_VOTE") or "1").strip().lower()
+    return value not in ("off", "0", "false", "no", "disable", "disabled")
+
+
+def _identity_cache_ttl():
+    """QD_MACHINE_IDENTITY_CACHE_TTL：秒；0（默认）＝不过期。
+
+    正数=到期后清组件种子并重取（**真的换出新身份**，见 _purge_identity_seed）
+    ——这是设计 §3.3 的"定期轮换"开关；到期只是重新调组件、不换种子的话，
+    同种子下会拿回同一个身份，开关等于没生效。
+    """
+    try:
+        ttl = float(os.environ.get("QD_MACHINE_IDENTITY_CACHE_TTL") or 0)
+    except (TypeError, ValueError):
+        ttl = 0.0
+    return max(0.0, ttl)
+
+
+def _identity_cache_log(level, message):
+    """缓存事件输出到 stderr；去重由各调用点的标记控制。"""
+    try:
+        import sys
+        print("[machine-identity] %s: %s" % (level, message), file=sys.stderr)
+    except Exception:
+        pass
+
+
+def _identity_entry_to_ident(entry):
+    """缓存条目 -> ident dict；字段不全/类型不对时返回 None（视为无缓存）。"""
+    if not isinstance(entry, dict):
+        return None
+    token = str(entry.get("machineToken") or "").strip()
+    mtype = str(entry.get("machineType") or "").strip()
+    code = str(entry.get("machineCode") or "").strip()
+    if not (token and mtype and code):
+        return None
+    vm_info = entry.get("vm_info") if isinstance(entry.get("vm_info"), dict) else {}
+    return {"machineToken": token, "machineType": mtype, "machineCode": code,
+            "vm": bool(entry.get("vm")),
+            "vm_info": vm_info,
+            "source": str(entry.get("source") or MACHINE_IDENTITY_NATIVE)}
+
+
+def _identity_entry_expired(entry, ttl, now):
+    """按 TTL 判断条目是否过期（TTL=0 永不过期；cached_at 缺失视为过期）。"""
+    if ttl <= 0:
+        return False
+    try:
+        cached_at = float(entry.get("cached_at") or 0)
+    except (TypeError, ValueError):
+        return True
+    return (now - cached_at) >= ttl
+
+
+def _identity_cache_warn_corrupt(reason):
+    """损坏/字段不全：WARN 一次（进程内），随后按"无缓存"重建。"""
+    global _identity_cache_corrupt_warned
+    if _identity_cache_corrupt_warned:
+        return
+    _identity_cache_corrupt_warned = True
+    _identity_cache_log(
+        "WARN", "machine identity cache unreadable (%s); regenerating" % reason)
+
+
+def _read_identity_cache_doc():
+    """读缓存文档；文件缺失返回空壳；损坏/结构异常返回空壳（并首次 WARN）。
+
+    绝不抛异常——缓存损坏只降级为"无缓存"，不影响业务流程。
+    """
+    path = machine_identity_cache_path()
+    try:
+        with open(path, encoding="utf-8") as fh:
+            doc = json.load(fh)
+    except FileNotFoundError:
+        return {"version": 1, "realm": {}}
+    except Exception as exc:
+        _identity_cache_warn_corrupt("%s: %s" % (type(exc).__name__, exc))
+        return {"version": 1, "realm": {}}
+    if not (isinstance(doc, dict) and isinstance(doc.get("realm"), dict)):
+        _identity_cache_warn_corrupt("unexpected structure")
+        return {"version": 1, "realm": {}}
+    return doc
+
+
+def _load_identity_cache(realm, now, allow_expired=False):
+    """读落盘缓存；返回 ident dict 或 None（无 / 损坏 / 字段不全 / 过期）。"""
+    entry = (_read_identity_cache_doc().get("realm") or {}).get(realm)
+    if entry is None:
+        return None
+    ident = _identity_entry_to_ident(entry)
+    if ident is None:
+        _identity_cache_warn_corrupt("missing fields")
+        return None
+    if not allow_expired and _identity_entry_expired(entry, _identity_cache_ttl(), now):
+        return None
+    return ident
+
+
+def _identity_cache_expired_entry_exists(realm, now):
+    """落盘存在该 realm 的**有效条目**、但已按 TTL 过期（TTL 轮换路径专用）。
+
+    用于区分"首次无缓存/损坏"与"TTL 到期"：只有后者才在重取前清组件种子
+    （让"定期轮换"真的换出新身份，见 _purge_identity_seed）。
+    """
+    entry = (_read_identity_cache_doc().get("realm") or {}).get(realm)
+    if entry is None or _identity_entry_to_ident(entry) is None:
+        return False
+    return _identity_entry_expired(entry, _identity_cache_ttl(), now)
+
+
+def _write_identity_cache_doc(doc):
+    """原子写缓存文档（临时文件 + os.replace、权限 0600）；失败静默返回 False。"""
+    path = machine_identity_cache_path()
+    tmp = path + ".tmp"
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(doc, fh, ensure_ascii=False, indent=2)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+        return True
+    except OSError:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        return False
+
+
+def _save_identity_cache(realm, ident, force=False):
+    """把身份写入落盘缓存（读-改-写 + 锁 + 原子替换）。
+
+    返回 None = 采纳新值（已写盘）；返回 dict = 以磁盘既有值为准（并发防御：
+    另一个实例刚写入未过期的缓存，见设计 §4②"keeping cached"）。
+    """
+    global _identity_cache_diff_warned
+    with _IDENTITY_CACHE_LOCK:
+        doc = _read_identity_cache_doc()
+        realms = doc.setdefault("realm", {})
+        old_entry = realms.get(realm)
+        old_ident = _identity_entry_to_ident(old_entry) if old_entry else None
+        if (not force and old_ident is not None
+                and not _identity_entry_expired(old_entry, _identity_cache_ttl(),
+                                                time.time())
+                and old_ident != ident):
+            if not _identity_cache_diff_warned:
+                _identity_cache_diff_warned = True
+                _identity_cache_log(
+                    "INFO",
+                    "identity cache differs from fresh component output; keeping cached")
+            return old_ident
+        entry = dict(ident)
+        entry["cached_at"] = time.time()
+        realms[realm] = entry
+        doc["version"] = 1
+        _write_identity_cache_doc(doc)
+        if force and old_ident is not None:
+            _identity_cache_log(
+                "WARN",
+                "machine identity refreshed after upstream rejection (cache updated) — %s"
+                % realm)
+        return None
+
+
+def _purge_identity_seed():
+    """删除组件的身份种子 $HOME/.config/.locale_cfg；缺失即忽略、异常不外抛。
+
+    组件输出由该随机种子决定（#18 实测：同种子下重复调用返回同一身份，
+    删种子后必换新身份并写回新种子）。只有三条**显式换身份**路径才清它：
+    ① force 自愈（否则拿到还是被拒的同一个身份，自愈空转）；②
+    QD_MACHINE_IDENTITY_RESET（用户主动换）；③ TTL 到期后的那次调用
+    （定期轮换——不换种子这个开关就是空的）。其它路径（缓存命中、组件
+    失败回退、首次无缓存获取）绝不动，否则「重建不换」的缓存会失去意义。
+    返回是否真的删除了文件；任何失败都静默（身份拿不到才是大事故）。
+    """
+    try:
+        path = os.path.join(os.path.expanduser("~"), ".config", ".locale_cfg")
+        if os.path.exists(path):
+            os.remove(path)
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _consume_identity_reset():
+    """QD_MACHINE_IDENTITY_RESET=1：清空落盘缓存（进程内只消费一次）。
+
+    直接删 accounts/machine_identity.json 同样有效（最直观，不必记变量名）。
+    """
+    global _identity_reset_done
+    if _identity_reset_done:
+        return
+    if (os.environ.get("QD_MACHINE_IDENTITY_RESET") or "").strip().lower() \
+            not in ("1", "true", "yes", "on"):
+        return
+    _identity_reset_done = True
+    with _IDENTITY_CACHE_LOCK:
+        try:
+            os.remove(machine_identity_cache_path())
+            _identity_cache_log(
+                "INFO", "machine identity cache cleared (QD_MACHINE_IDENTITY_RESET=1)")
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            _identity_cache_log(
+                "WARN", "could not clear machine identity cache: %s" % exc)
+    # 主动换身份必须连种子一起换：只清缓存会复刻出一个**完全相同**的身份
+    # （#18：身份由种子决定），等于没换。
+    _purge_identity_seed()
+
+
+def _sample_identity(realm, account_id):
+    """单次调用组件并构造 ident dict；组件无输出或字段不全时返回 {}。"""
+    data = run_runtime_info(realm, account_id)
+    if not data:
+        return {}
+    token = str(data.get("machineToken") or "").strip()
+    mtype = str(data.get("machineType") or "").strip()
+    code = str(data.get("machineCode") or "").strip()
+    vm_info = data.get("vmInfo") if isinstance(data.get("vmInfo"), dict) else {}
+    if not (token and mtype and code):
+        return {}
+    return {"machineToken": token, "machineType": mtype, "machineCode": code,
+            "vm": bool(vm_info.get("isVm")),
+            "vm_info": vm_info,
+            "source": MACHINE_IDENTITY_NATIVE}
+
+
+def _identity_vote_key(ident):
+    """表决键：token + 三元组判别字段（type/code/isVm/brand/vmTypeCode）。
+
+    刻意排除 vmInfo.percentage 这类连续噪声字段——它们波动不应破坏多数表决；
+    写盘采用选中样本的**完整** vmInfo（三元组天然自洽、不逐字段杂交）。
+    """
+    vm = ident.get("vm_info") if isinstance(ident.get("vm_info"), dict) else {}
+    try:
+        vm_type_code = int(vm.get("vmTypeCode") or 0)
+    except (TypeError, ValueError):
+        vm_type_code = -1
+    return (ident.get("machineToken"), ident.get("machineType"),
+            ident.get("machineCode"), bool(vm.get("isVm")),
+            str(vm.get("brand") or ""), vm_type_code)
+
+
+def _identity_branch_label(ident):
+    """提取样本的（品牌, vmTypeCode），用于投票日志。"""
+    vm = ident.get("vm_info") if isinstance(ident.get("vm_info"), dict) else {}
+    return str(vm.get("brand") or "unknown"), vm.get("vmTypeCode")
+
+
+def _first_identity_with_vote(realm, account_id, rounds=IDENTITY_VOTE_ROUNDS,
+                              extend_rounds=IDENTITY_VOTE_EXTEND_ROUNDS):
+    """首次落盘前的**自适应**多数表决：先采样 rounds 次；全一致直接采纳，
+    出现分歧则再补 extend_rounds 次（上限有界），取出现次数最多的**完整样本**。
+
+    - 取完整样本 = machineType / machineCode / vmInfo 天然自洽（不逐字段拼）；
+    - 唯一多数 → 采纳；平票 / 全分歧 → 取**首次出现的**样本（确定性），
+      日志明确写出不一致与补投过程；
+    - 全部采样都无输出（组件不可用）时返回 {}，交给既有失败回退路径；
+    - 本函数绝不清种子（那是 force / RESET / TTL 轮换的换身份路径）。
+    """
+    def take(count):
+        got = []
+        for _ in range(max(0, int(count))):
+            sample = _sample_identity(realm, account_id)
+            if sample:
+                got.append(sample)
+        return got
+
+    samples = take(max(1, int(rounds)))
+    if not samples:
+        return {}
+    tally = {}
+    for sample in samples:
+        tally.setdefault(_identity_vote_key(sample), []).append(sample)
+    if len(tally) == 1:
+        # 首轮全一致：直接采纳（证据见常量区注释——最常见情形，成本不增加）
+        picked = samples[0]
+        brand, vm_type_code = _identity_branch_label(picked)
+        _identity_cache_log(
+            "INFO", "identity vote: %d/%d %s (vmTypeCode=%s)"
+            % (len(samples), len(samples), brand, vm_type_code))
+        return picked
+    # 出现分歧：补投（上限 rounds+extend_rounds，保证首次延迟有界）
+    samples.extend(take(extend_rounds))
+    tally = {}
+    for sample in samples:
+        tally.setdefault(_identity_vote_key(sample), []).append(sample)
+    top_key = max(tally, key=lambda key: len(tally[key]))
+    top_count = len(tally[top_key])
+    total = len(samples)
+    unique_top = sum(1 for key in tally if len(tally[key]) == top_count) == 1
+    first_brand, first_vtc = _identity_branch_label(samples[0])
+    if unique_top:
+        picked = tally[top_key][0]
+        brand, vm_type_code = _identity_branch_label(picked)
+        minority_names = "/".join(
+            _identity_branch_label(tally[key][0])[0]
+            for key in tally if key != top_key)
+        summary = ("%d rounds disagreed; extended to %d -> %d/%d %s "
+                   "(%d minority %s; vmTypeCode=%s)"
+                   % (int(rounds), total, top_count, total, brand,
+                      total - top_count, minority_names, vm_type_code))
+    else:
+        picked = samples[0]
+        distribution = " / ".join(
+            "%s %d" % (_identity_branch_label(tally[key][0])[0], len(tally[key]))
+            for key in tally)
+        summary = ("%d rounds disagreed; extended to %d -> no majority (%s); "
+                   "using first sample (%s, vmTypeCode=%s)"
+                   % (int(rounds), total, distribution, first_brand, first_vtc))
+    _identity_cache_log("INFO", "identity vote: " + summary)
+    return picked
+
+
 def native_machine_identity(realm, account_id, force=False):
     """调用官方原生桥取真实机器身份；任何失败返回 {}（调用方回退派生值）。
 
     身份是**机器级**的（实测不同 account id 返回同一份），按区域短缓存
-    NATIVE_IDENTITY_TTL 秒——它会随时间轮换，长缓存会拿到过期身份导致活动
-    列表被过滤；force=True 时跳过缓存重新取值。
+    NATIVE_IDENTITY_TTL 秒；force=True 跳过缓存重新取值（服务端明确拒绝时的
+    自愈路径才用它——见设计 §9.1）。
+
+    落盘缓存（issue #18）：组件输出由本机种子文件（$HOME/.config/.locale_cfg）
+    决定——同一种子下重复调用返回**同一个**身份，删种子才换新（见
+    _purge_identity_seed）。只有**缓存优先**（落盘命中就不调组件）才能让
+    Docker 重建/升级容器后身份不变；组件不可用时回退落盘缓存（哪怕过期），
+    不再被迫退化到 derived 假身份。
+
+    另：**首次落盘**前对组件做自适应多数表决（先 IDENTITY_VOTE_ROUNDS 次，
+    分歧时补至 IDENTITY_VOTE_ROUNDS + IDENTITY_VOTE_EXTEND_ROUNDS 次，取出现
+    次数最多的完整样本）——组件的 VM 判定会抖到另一分支（实测 1.56%~10.29%），
+    单次采样会把用户永久固定到少数派（QD_MACHINE_IDENTITY_VOTE=0 可关闭表决）。
     """
     now = time.time()
+    cache_on = _identity_cache_enabled()
+    ttl_rotation = False
+    _consume_identity_reset()
     if not force:
+        # ① 内存缓存（1800s，现状不变）
         hit = _native_ident_cache.get(realm)
         if hit and now - hit[0] < NATIVE_IDENTITY_TTL:
             return hit[1]
-    ident = {}
-    data = run_runtime_info(realm, account_id)
-    if data:
-        token = str(data.get("machineToken") or "").strip()
-        mtype = str(data.get("machineType") or "").strip()
-        code = str(data.get("machineCode") or "").strip()
-        vm_info = data.get("vmInfo") if isinstance(data.get("vmInfo"), dict) else {}
-        if token and mtype and code:
-            ident = {"machineToken": token, "machineType": mtype,
-                     "machineCode": code,
-                     "vm": bool(vm_info.get("isVm")),
-                     "vm_info": vm_info,
-                     "source": "runtime-info"}
-    _native_ident_cache[realm] = (now, ident)
-    return ident
+        # ② 落盘缓存：命中就**不调组件**（本设计的核心）
+        if cache_on:
+            stored = _load_identity_cache(realm, now)
+            if stored is not None:
+                _native_ident_cache[realm] = (now, stored)
+                if realm not in _identity_cache_reuse_logged:
+                    _identity_cache_reuse_logged.add(realm)
+                    _identity_cache_log(
+                        "INFO",
+                        "machine identity cache: reusing cached identity for %s "
+                        "(rebuilds keep the same device)" % realm)
+                return stored
+            # TTL 到期（有记录但已过期）＝"定期轮换"路径；与"首次无缓存"
+            # 区分开：只有它才在重取前清种子，让轮换真的换出**新身份**。
+            ttl_rotation = _identity_cache_expired_entry_exists(realm, now)
+    # 清种子的三条路径（后来人最容易漏第三条）：
+    #   ① force=True：服务端已不认当前身份 → 自愈必须换一个**新的**
+    #      （同种子下组件只会返回同一个被拒身份，不换种子等于自愈空转）；
+    #   ② QD_MACHINE_IDENTITY_RESET=1：用户主动换
+    #      （在 _consume_identity_reset 里处理：缓存与种子一起清）；
+    #   ③ TTL 到期后的这次调用：让"定期轮换"开关真的生效——不换种子它
+    #      只是重新调一次组件、拿回同一个身份，等于空开关。
+    # 不清种子的路径：缓存命中（根本不调组件）、组件失败回退缓存、首次无
+    # 缓存的正常获取（那时用户并没有要求换身份）。
+    if force or ttl_rotation:
+        _purge_identity_seed()
+    # ③ 调组件（首次落盘时做多数表决：组件的 VM 判定有 1~2% 概率抖到另一
+    #    分支，单次采样会把用户永久固定到少数派。表决只在"首次无可用缓存"
+    #    发生；force 自愈 / TTL 轮换 / 缓存关闭 保持单次调用不变。）
+    if cache_on and not force and not ttl_rotation and _identity_vote_enabled():
+        ident = _first_identity_with_vote(realm, account_id)
+    else:
+        ident = _sample_identity(realm, account_id)
+    if ident:
+        if cache_on:
+            kept = _save_identity_cache(realm, ident, force=force)
+            if kept is not None:
+                ident = kept
+        _native_ident_cache[realm] = (now, ident)
+        return ident
+    # ④ 组件失败：回退落盘缓存（哪怕已过期）——alpine 缺兼容层/组件被删时
+    #    仍能用真身份，比 derived 好（设计 §3.2 第 3 行）。
+    if cache_on:
+        stored = _load_identity_cache(realm, now, allow_expired=True)
+        if stored is not None:
+            _native_ident_cache[realm] = (now, stored)
+            return stored
+    _native_ident_cache[realm] = (now, {})
+    return {}
 
 # 签到能力探测缓存：404（接口不存在）后 N 秒内不再重复探测，避免每次巡检都
 # 打一个必然失败的请求；到期自动重探，官方上线即可自动恢复。
@@ -283,6 +773,10 @@ CHECKIN_PROBE_TTL = 6 * 3600
 # 活动列表缓存 TTL：活动状态变化很慢（每日一轮），20 秒内复用可让看板切换视图
 # /账号不再等那 1–4 秒的上游请求；领取动作会强制绕过并立即失效缓存。
 CAMPAIGNS_TTL = 20
+
+# 活动平台 claim 请求之间的默认间隔（秒）：调用方（qoder_tasks.run_checkin）的
+# gap 未透传时的安全默认，保持「>= 1.0s 防风控」语义（见 qoder_tasks 模块声明）。
+CLAIM_GAP_DEFAULT = 1.0
 
 def campaign_label(c):
     """活动显示名：官方中文标题（placements content.zh.title）优先，其次 key。"""
@@ -342,6 +836,35 @@ def normalize_epoch(value):
     if number > 1e11:      # 毫秒
         number /= 1000.0
     return int(number)
+
+
+# ---------------------------------------------------------------------------
+# 每日签到的「下次可签到时间」
+# ---------------------------------------------------------------------------
+# 官方规则：每日 10:00（UTC+8）刷新，错过不补。因此这条时间**必须**按固定
+# UTC+8 计算与呈现，**不能**用系统本地时区——容器里常是 UTC，若按本地渲染，
+# 用户看到的「下次」会和官方说明差 8 小时，对不上。
+CHECKIN_WINDOW_HOUR_UTC8 = 10
+_UTC8 = datetime.timezone(datetime.timedelta(hours=8))
+
+
+def next_checkin_window(now=None):
+    """下一个「每日 10:00（UTC+8）」窗口 → (epoch 秒:int, 人类可读:str)。
+
+    边界（与 issue #20 的口径一致）：
+      · 今天 10:00 **之前**（now < 当日 10:00）→ 今天 10:00；
+      · 到达/晚于 10:00（含刚领取成功的情形）→ 明天 10:00。
+      取「到达即算下一轮」是为了不返回一个已经到点的时刻。
+    note 形如 "10-05 10:00（UTC+8）"，始终以 UTC+8 呈现；两个返回值同源，
+    调用方只需调一次即可拿到成对的字段，避免两处各算一遍导致不一致。
+    """
+    ts = time.time() if now is None else float(now)
+    now8 = datetime.datetime.fromtimestamp(ts, _UTC8)
+    boundary = now8.replace(hour=CHECKIN_WINDOW_HOUR_UTC8, minute=0,
+                            second=0, microsecond=0)
+    if now8 >= boundary:
+        boundary += datetime.timedelta(days=1)
+    return int(boundary.timestamp()), boundary.strftime("%m-%d %H:%M") + "（UTC+8）"
 
 
 # ---------------------------------------------------------------------------
@@ -529,7 +1052,7 @@ class Account(object):
         # 活动列表短缓存 (at, payload)：该请求约 1–4 秒（上游最慢的一环），
         # 看板切换视图/账号会连续取，缓存后由"领取动作"显式失效。
         self._campaigns_cache = None
-        # 活动平台用的机器身份来源：native(官方原生桥) / derived(派生回退)
+        # 活动平台用的机器身份来源：runtime-info(官方原生桥) / derived(派生回退)
         self.machine_identity_source = "derived"
         # 账号级 IP 代理（单行 URL，如 socks5h://user:pass@1.2.3.4:1080）：
         # 配置后该账号的全部上游流量（推理/刷新/签到/额度/活动/登录…）都走
@@ -538,6 +1061,9 @@ class Account(object):
         self.proxy_failures = int(data.get("proxyFailures") or 0)
         self.proxy_last_error = str(data.get("proxyLastError") or "")
         self._opener_cache = None
+        # 最近一次 desktop_headers() 实际是否携带 cosy-machine* 头：
+        # native / omitted（未构造过时按 omitted 保守处理）；与身份来源正交
+        self.machine_headers_state = MACHINE_HEADERS_OMITTED
 
     # -- 持久化 ------------------------------------------------------------
     def to_dict(self):
@@ -784,28 +1310,61 @@ class Account(object):
           MachineType / MachineCode
 
         两层坑（都已踩过）：
-          1. 缺这些头 → 服务端不报错但返回**空活动列表**；
-          2. 机器身份用派生假值 → 列表里**静默少掉设备定向活动**
-             （"每日领取 100 Credits"），只有官方原生桥取到的真身份才完整。
-        因此这里优先用 runtime-info.exe 的真值，失败才回退稳定派生值。
+          1. 缺 UA / cosy-clienttype / cosy-version → 服务端不报错但返回
+             **空活动列表**（实测这三个是展示活动所必需）。
+          2. 机器头「半套」问题（issue #10，Linux/Docker 实测）：服务端把
+             **全套派生** cosy-machine* 六头判定为非官方客户端，把 CLAIMABLE 的
+             「每日领取 100 Credits」**整条过滤**，列表只剩 VIEW_DETAILS 类；
+             已领取账号不受影响（所以首次领取时最易误判为"本来就没活动"）。
+             逐头隔离实测：六头任一个**单独**出现 → 活动可见；六头全发 →
+             被过滤；去掉 machinetoken 或 machineid → 可见。
+        因此本函数的策略（issue #10 修复）：
+          - 原生桥给出真身份（machineToken 非空）→ 发全套六头，保持官方
+            客户端同款行为（真头是否额外解锁设备定向活动未验证，维持现状）；
+          - derived 分支（无原生桥，如 Linux/Docker）→ **一律不发** cosy-machine*
+            六头，只发 UA / cosy-clienttype / cosy-version。
+        machine_identity_source 依旧如实记录（看板与诊断在用）。
         """
         h = dict(self.headers())
         h["User-Agent"] = "Qoder"
         h["cosy-clienttype"] = DESKTOP_CLIENT_TYPE
         h["cosy-version"] = desktop_version()
-        # 代理账号跳过原生桥（防宿主机 IP 经官方二进制泄漏），用派生身份。
+        # 代理账号跳过原生桥（防宿主机 IP 经官方二进制泄漏）。_native_identity
+        # 对代理账号返回无 machineToken 的占位 → 走下方 else 分支不发机器头，
+        # 恰好符合 issue #10 的结论：派生机器头会被服务端判非官方客户端、
+        # 整条过滤 CLAIMABLE 活动，一个机器头都不发才是正确降级。
         ident = self._native_identity()
-        h["cosy-machineid"] = derive_id(self.uid, "machine")
-        h["cosy-machinetoken"] = ident.get("machineToken") or \
-            derive_machine_token(self.uid)
-        h["cosy-machinetype"] = ident.get("machineType") or \
-            derive_machine_type(self.uid)
-        h["cosy-machinecode"] = ident.get("machineCode") or \
-            derive_id(self.uid, "machinecode")
-        h["cosy-machineos"] = MACHINE_OS
-        h["cosy-machinehostname"] = MACHINE_HOSTNAME
+        if ident.get("machineToken"):
+            h["cosy-machineid"] = derive_id(self.uid, "machine")
+            h["cosy-machinetoken"] = ident.get("machineToken") or \
+                derive_machine_token(self.uid)
+            h["cosy-machinetype"] = ident.get("machineType") or \
+                derive_machine_type(self.uid)
+            h["cosy-machinecode"] = ident.get("machineCode") or \
+                derive_id(self.uid, "machinecode")
+            h["cosy-machineos"] = MACHINE_OS
+            h["cosy-machinehostname"] = MACHINE_HOSTNAME
+            self.machine_headers_state = MACHINE_HEADERS_NATIVE
+        else:
+            # 无原生身份（含代理账号跳过原生桥）：一个机器头都不发（issue #10）。
+            self.machine_headers_state = MACHINE_HEADERS_OMITTED
         self.machine_identity_source = ident.get("source") or "derived"
         return h
+
+    def _machine_headers_hint(self):
+        """机器头状态相关的可读提示；当前只在 INTL + 未发送机器头时非空。
+
+        国际版服务端要求真实的 UMID 机器身份（官方客户端组件生成、每 50 分钟
+        刷新）。本机无该组件时必须"不发头"（issue #10），服务端可能因此不返回
+        活动——这是**已知限制**，不要误报成"今天没有活动"。CN 侧不发头是正确
+        行为，不给提示。
+        """
+        if self.realm == "intl" and \
+                getattr(self, "machine_headers_state", "") == MACHINE_HEADERS_OMITTED:
+            return ("国际版服务端要求真实的 UMID 机器身份（由官方客户端组件生成、"
+                    "每 50 分钟刷新），本机没有该组件、本次未发送机器头：活动列表"
+                    "可能不可见、领取可能失败。这是已知限制，不等于今天没有活动。")
+        return ""
 
     # -- 刷新（按 token 前缀路由） ----------------------------------------
     def refresh(self):
@@ -1056,8 +1615,9 @@ class Account(object):
         **真实机器身份**（原生桥取，见 `native_machine_identity`）。两者任一
         不对都表现为 HTTP 200 + 列表里少活动（不报错），这正是"领不到"的根因。
 
-        机器身份会轮换：若本次 `showCampaign=false`（通常意味着身份被判定为
-        非官方客户端），强制刷新一次身份并重试，避免缓存过期导致整天领不到。
+        身份被拒时的自愈：若本次 `showCampaign=false`（通常意味着身份被判定为
+        非官方客户端），清掉组件种子、强制换一个**新的**身份并重试，避免被拒
+        的身份一直卡到重建容器（#18：同种子下组件只会返回同一个身份）。
         结果短缓存 CAMPAIGNS_TTL 秒（force=True 绕过）——该请求是上游最慢的
         一环，看板切换视图时不该重复等它。
 
@@ -1069,15 +1629,31 @@ class Account(object):
                 and now - self._campaigns_cache[0] < CAMPAIGNS_TTL:
             return self._campaigns_cache[1]
         q, code, err = self._campaigns_get()
+        # 自愈条件必须与生产端同源：machine_identity_source 的合法值是
+        # MACHINE_IDENTITY_NATIVE("runtime-info") 或 "derived"；"native" 仅为
+        # 历史/测试桩别名。此前误用 native 字面量做等值判断，导致此分支永不命中
+        # （口径分裂，已按 Lead 裁决统一到 runtime-info）。
+        # 取舍留痕（勿误读为漏写）：此处**不做**缓存新鲜度节流。曾评估"仅当
+        # _native_ident_cache 缺失或 ≥NATIVE_IDENTITY_TTL 才自愈"的方案，未采纳：
+        # 该阈值会在"缓存新鲜但身份已被服务端作废"时阻止自愈，把用户重新打回
+        # "整天领不到"的原始故障；宁可多一次刷新（原生桥实测 3.7s，且触发条件
+        # 仅为服务端明确返回 showCampaign=false、并非高频路径），也不制造
+        # "为什么没自愈"的新谜题（Lead 裁决，不实施）。
         if isinstance(q, dict) and not q.get("showCampaign") \
-                and getattr(self, "machine_identity_source", "") == "native":
+                and getattr(self, "machine_identity_source", "") in \
+                (MACHINE_IDENTITY_NATIVE, "native"):
+            # 服务端已不认当前身份，必须换一个**新的**：force 跳过全部缓存并
+            # **覆盖落盘**（设计 §9.1/§9.2 写入点②），否则重建后仍会用被拒的旧身份。
             native_machine_identity(self.realm, self.uid, force=True)
             q2, code2, err2 = self._campaigns_get()
             if isinstance(q2, dict) and q2.get("showCampaign"):
                 q, code, err = q2, code2, err2
         if not isinstance(q, dict):
             return {"ok": False, "available": code not in (404, 405, 410),
-                    "error": err or ("HTTP %d" % code)}
+                    "error": err or ("HTTP %d" % code),
+                    "machine_headers": getattr(self, "machine_headers_state",
+                                               MACHINE_HEADERS_OMITTED),
+                    "hint": self._machine_headers_hint()}
         items = []
         raw = q.get("campaigns")
         for c in (raw if isinstance(raw, list) else []):
@@ -1129,8 +1705,14 @@ class Account(object):
             "claimable": bool(q.get("claimable")),
             "campaign_url": str(q.get("campaignUrl") or ""),
             "campaigns": items,
-            # 机器身份来源：derived 时设备定向活动可能被服务端过滤（列表偏少）
+            # 身份来源（runtime-info=原生桥 / derived=派生回退；与下面的
+            # machine_headers 正交——derived 时本次根本不发机器头，issue #10）
             "identity": getattr(self, "machine_identity_source", "derived"),
+            # 本次实际是否携带 cosy-machine* 机器头：native / omitted
+            "machine_headers": getattr(self, "machine_headers_state",
+                                       MACHINE_HEADERS_OMITTED),
+            # INTL+omitted 时的"已知限制"提示；其余场景为空串（CN 不发提示）
+            "hint": self._machine_headers_hint(),
         }
         self.campaign_status = st
         self._campaigns_cache = (time.time(), st)
@@ -1222,28 +1804,41 @@ class Account(object):
     # 兼容类内调用：self.campaign_label(c) / qoder_accounts.campaign_label(c)
     campaign_label = staticmethod(campaign_label)
 
-    def campaign_checkin(self, gap=0.5, only_kinds=None):
+    def campaign_checkin(self, gap=None, only_kinds=None):
         """活动平台签到：领取所有 CLAIMABLE 的 Credits 活动（每日 100 等）。
 
-        先强制刷新原生机器身份（身份会轮换，缓存过期会让列表被过滤 → 漏领），
-        再列活动、逐个领取。多账户场景下每个账号独立走这一遍。
+        先取一次机器身份（内存 → 落盘 → 组件；**不**强制换新——避免把
+        「重建不换」的落盘缓存刷掉，设计 §9.1），再列活动、逐个领取。
+        多账户场景下每个账号独立走这一遍。
 
         only_kinds: 只领这些 benefit.kind 的活动（如 ("", "CREDITS") 表示只做
                     每日签到领积分，不动兑换码/券类福利）。
+        gap: 相邻两次 claim 请求之间的间隔（秒）；None=使用模块级安全默认
+             CLAIM_GAP_DEFAULT（>=1.0s），显式传入时按传入值（下限 0）。
 
-        返回 {ok, claimed:[...], already:[...], earned, message, campaigns}
+        返回 {ok, claimed:[...], already:[...], earned, message, campaigns,
+              next_available_at, next_available_note}
           - 已是 CLAIMED 的活动计入 already（"今日已领取"）
           - 无可领取项且没有任何活动 -> ok=True + message 说明
+          - next_available_at / next_available_note：下一个「每日 10:00（UTC+8）」
+            的 epoch 秒与可读文本（见 next_checkin_window）；**无论本次是否真的
+            领到都给出**，前端只在"没到账"时渲染。
         """
-        # 代理账号跳过原生桥（防宿主机 IP 泄漏）；派生身份下"设备定向"活动
-        # 可能被服务端过滤，但常规 Credits 领取不受影响。
+        claim_gap = CLAIM_GAP_DEFAULT if gap is None else max(0.0, float(gap))
+        # 代理账号跳过原生桥（防宿主机 IP 经官方二进制泄漏）。
+        # 领取前只需"身份有效"（内存 → 落盘 → 组件），**不要** force 刷新：
+        # force 会让每次签到都换一套身份并把落盘缓存刷掉，「重建不换」就失效了
+        # （设计 §9.1）。身份真被服务端作废时由 campaigns() 的自愈兜底刷新。
         if not self.proxy:
-            native_machine_identity(self.realm, self.uid, force=True)
+            native_machine_identity(self.realm, self.uid)
         st = self.campaigns(force=True)      # 领取路径必须绕过缓存，看最新状态
         if not st.get("ok"):
+            next_at, next_note = next_checkin_window()
             return {"ok": False, "error": st.get("error") or "campaigns 查询失败",
                     "earned": 0, "claimed": [], "already": [], "blocked": [],
-                    "pending": [], "locked": [], "codes": [], "views": []}
+                    "pending": [], "locked": [], "codes": [], "views": [],
+                    "next_available_at": next_at,
+                    "next_available_note": next_note}
         claimed, already, earned, errors, blocked = [], [], 0, [], []
         pending, locked, codes, views = [], [], [], []   # 券/成就/详情类
         for c in st["campaigns"]:
@@ -1293,7 +1888,6 @@ class Account(object):
                 if res.get("redemption_code"):
                     codes.append({"campaign": label,
                                   "code": res["redemption_code"]})
-                time.sleep(max(0.0, gap))
             elif res.get("blocked"):
                 # 服务端按"人"去重：同机器/同身份下其他账号本轮已领。
                 # 记 6 小时冷却（多账号同机器时不必每轮都试），并保留原因。
@@ -1309,6 +1903,9 @@ class Account(object):
                 slot.append(c)
             else:
                 errors.append("%s: %s" % (cname, res.get("error")))
+            # 每个 claim 请求之后统一等待一次：成功/被挡/失败都刚打过上游，
+            # 相邻请求间隔由 gap 保证（默认 CLAIM_GAP_DEFAULT，防风控）。
+            time.sleep(claim_gap)
         if claimed:
             msg = "活动领取成功 +%d Credits（%s）" % (
                 earned, "、".join(self.campaign_label(c) for c in claimed))
@@ -1345,11 +1942,16 @@ class Account(object):
             msg += extra
         # 领取动作会改变活动状态：让下一次列表查询重新拉取（不吃 20s 缓存）
         self._campaigns_cache = None
+        # 「下次可签到时间」无条件给出（真领取 / 已领 / 被挡 / 名额发完 / 任务未完成 /
+        # 无可领项 全部走这一个出口）：是否渲染由前端按需决定，后端不替前端判断。
+        next_at, next_note = next_checkin_window()
         return {"ok": not errors, "claimed": claimed, "already": already,
                 "blocked": blocked, "earned": earned, "message": msg,
                 "pending": pending, "locked": locked, "codes": codes,
                 "views": views,
-                "campaigns": st["campaigns"], "errors": errors}
+                "campaigns": st["campaigns"], "errors": errors,
+                "next_available_at": next_at,
+                "next_available_note": next_note}
 
 
     def _stamp_checkin(self):
@@ -2321,9 +2923,6 @@ def import_desktop_credential(path=None, realm=None, proxy=""):
 EXPORT_FORMAT = "qoder-accounts"
 EXPORT_VERSION = 1
 
-# 描述运行期状态而非凭证本身的字段：导入时导出可查、但绝不信任。
-VOLATILE_FIELDS = ("cooldownUntil", "lastError", "credits", "lastCheckin", "plan")
-
 
 def account_to_export(account):
     data = account.to_dict()
@@ -2389,7 +2988,11 @@ def _coerce_account_rows(blob):
 
 
 def normalise_import_row(row, realm=None):
-    """把一行导入数据规整成 Account kwargs；无可用凭证时 raise ValueError。"""
+    """把一行导入数据规整成 Account kwargs；无可用凭证时 raise ValueError。
+
+    运行期字段（cooldownUntil/lastError/credits/lastCheckin/plan）不随导入采信：
+    返回值只构造凭证与身份字段，运行期状态一律重置或缺失（白名单构造）。
+    """
     auth = row.get("auth") if isinstance(row.get("auth"), dict) else None
     profile = row.get("account") if isinstance(row.get("account"), dict) else None
 
